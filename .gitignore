@@ -1,0 +1,46 @@
+# ── Data and model artifacts (tracked by DVC, not git) ─────────────────────
+/data/raw/*
+/data/processed/*
+/outputs/checkpoints/*
+/outputs/samples/*
+/outputs/quantized_models/*
+!/data/raw/.gitkeep
+!/data/processed/.gitkeep
+!/outputs/checkpoints/.gitkeep
+!/outputs/samples/.gitkeep
+!/outputs/quantized_models/.gitkeep
+*.dvc
+!/*.dvc.yaml
+
+# ── Python ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Environment / secrets ───────────────────────────────────────────────
+.env
+.venv/
+venv/
+
+# ── MLflow local artifacts (we use remote tracking, but ignore local mlruns) ─
+mlruns/
+mlartifacts/
+
+# ── Jupyter ──────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_meta
+
+# ── OS ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/

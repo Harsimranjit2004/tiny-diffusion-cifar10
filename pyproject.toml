@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tiny_diffusion"
+version = "0.1.0"
+description = "Tiny Conditional Diffusion on CIFAR-10: quantization study"
+requires-python = ">=3.10"
+
+# WHY explicit include= instead of bare auto-discovery:
+# `[tool.setuptools.packages.find] where=["src"]` alone relies on setuptools
+# correctly inferring this is a src-layout project. On some setuptools
+# versions/platforms this silently discovers ZERO packages and fails with
+# a confusing "No distribution was found" error during `pip install -e .`,
+# rather than telling you discovery found nothing. Being explicit with
+# include=["tiny_diffusion*"] removes the ambiguity entirely — setuptools
+# is told exactly what to look for under src/, not asked to guess.
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["tiny_diffusion*"]
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+# ── Black: code formatter ───────────────────────────────────────────────────
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+# ── isort: import sorter, configured to not fight black ───────────────────
+[tool.isort]
+profile = "black"
+line_length = 100
+known_first_party = ["tiny_diffusion"]
+
+# ── mypy: static type checker ───────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+# PyTorch's own type stubs are incomplete in places; this is the standard
+# pragmatic setting used across most PyTorch projects.
+[[tool.mypy.overrides]]
+module = ["torch.*", "torchvision.*", "einops.*"]
+ignore_missing_imports = true
+
+# ── pytest ───────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = "test_*.py"
+addopts = "-v --tb=short"
