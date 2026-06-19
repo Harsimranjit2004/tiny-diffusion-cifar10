@@ -1,18 +1,18 @@
-# ── Data and model artifacts (tracked by DVC, not git) ─────────────────────
 /data/raw/*
 /data/processed/*
 /outputs/checkpoints/*
 /outputs/samples/*
 /outputs/quantized_models/*
 !/data/raw/.gitkeep
+!/data/raw/*.dvc
 !/data/processed/.gitkeep
+!/data/processed/*.dvc
 !/outputs/checkpoints/.gitkeep
+!/outputs/checkpoints/*.dvc
 !/outputs/samples/.gitkeep
+!/outputs/samples/*.dvc
 !/outputs/quantized_models/.gitkeep
-*.dvc
-!.dvc
-!.dvc/*
-!/*.dvc.yaml
+!/outputs/quantized_models/*.dvc
 
 # ── Python ───────────────────────────────────────────────────────────────
 __pycache__/
@@ -46,3 +46,4 @@ Thumbs.db
 # ── IDE ──────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
+/test_dvc_file.txt
