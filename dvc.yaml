@@ -1,0 +1,194 @@
+# =============================================================================
+# dvc.yaml — DVC PIPELINE DEFINITION
+# Tiny Conditional Diffusion on CIFAR-10
+# =============================================================================
+#
+# WHAT THIS FILE DOES:
+#   Defines the six-stage pipeline as a DAG (directed acyclic graph).
+#   Run `dvc repro` and DVC will execute only the stages whose dependencies
+#   actually changed since the last run — skipping anything still valid.
+#   This is the entire point of using DVC pipelines instead of just `dvc add`:
+#   automatic dependency-aware re-execution, not manual bookkeeping of what's
+#   stale.
+#
+# HOW DVC DECIDES WHAT'S STALE:
+#   For every `deps:` entry, DVC hashes the file/folder. If that hash differs
+#   from what's recorded in dvc.lock (auto-generated, do not hand-edit), the
+#   stage and everything downstream of it is considered stale and reruns on
+#   the next `dvc repro`. Code files (the actual .py scripts) are deps too —
+#   changing training.py's logic correctly invalidates the train stage.
+#
+# THE PARAMS CONNECTION:
+#   Stages reference params.yaml via the `params:` key. This is DIFFERENT
+#   from Hydra (Phase 2 Step 4) — params.yaml is DVC's OWN mechanism for
+#   tracking which hyperparameter VALUES were used for cache invalidation
+#   purposes specifically. Hydra remains our actual config management system
+#   for composing configs and running the training script. We keep params.yaml
+#   as a thin, flat mirror of the Hydra values that matter for DVC's staleness
+#   tracking — see params.yaml itself for the exact sync strategy.
+# =============================================================================
+
+stages:
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 1 — DATA DOWNLOAD
+  # ───────────────────────────────────────────────────────────────────────
+  # WHY THIS IS ITS OWN STAGE (not folded into preprocessing):
+  #   Downloading CIFAR-10 is a ONE-TIME, NETWORK-DEPENDENT operation that
+  #   never needs to rerun once the raw files exist — separating it means
+  #   `dvc repro` never re-downloads 170MB just because we tweaked an
+  #   augmentation parameter in preprocessing. Splitting "fetch" from
+  #   "transform" is a standard data-pipeline pattern for exactly this reason.
+  data_download:
+    cmd: python scripts/download_data.py
+    deps:
+      - scripts/download_data.py
+    outs:
+      - data/raw/cifar-10-batches-py
+        # WHY no `cache: false` here: this IS the canonical raw data, we
+        # want DVC's full versioning (hash-tracked, pushed to the gdrive
+        # remote) so anyone reproducing this project gets bit-identical
+        # CIFAR-10, not "whatever torchvision happened to serve that day."
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 2 — PREPROCESSING
+  # ───────────────────────────────────────────────────────────────────────
+  # WHY THIS EXISTS AS A SEPARATE STAGE rather than doing augmentation
+  # live in the DataLoader during training:
+  #   Some preprocessing (computing dataset-wide normalization statistics,
+  #   verifying image integrity, converting to a faster-to-load tensor
+  #   format) is expensive to redo every single training run. We do it
+  #   ONCE here and cache the result. NOTE: random augmentations (random
+  #   crop, flip) still happen live in the DataLoader during training —
+  #   those must be random EVERY epoch, so they can't be precomputed.
+  #   This stage handles only the deterministic, reusable preprocessing.
+  preprocess:
+    cmd: python scripts/preprocess_data.py
+    deps:
+      - scripts/preprocess_data.py
+      - data/raw/cifar-10-batches-py
+      - src/tiny_diffusion/data/cifar10.py
+    params:
+      - data.normalize_mean
+      - data.normalize_std
+    outs:
+      - data/processed/cifar10_tensors.pt
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 3 — TRAINING
+  # ───────────────────────────────────────────────────────────────────────
+  # WHY metrics ARE NOT listed as `outs:` here:
+  #   `outs:` are for DVC-cached artifacts (the checkpoint itself). The
+  #   actual scalar metrics (loss curves, FID) live in MLflow/DagsHub —
+  #   we deliberately don't duplicate that into DVC-tracked metric files,
+  #   to avoid two systems disagreeing about "what the real numbers were."
+  #   DVC owns large binaries; MLflow owns metrics and run comparison.
+  train:
+    cmd: python scripts/train.py
+    deps:
+      - scripts/train.py
+      - data/processed/cifar10_tensors.pt
+      - src/tiny_diffusion/models/unet.py
+      - src/tiny_diffusion/models/blocks.py
+      - src/tiny_diffusion/models/embeddings.py
+      - src/tiny_diffusion/models/ema.py
+      - src/tiny_diffusion/diffusion/schedule.py
+      - src/tiny_diffusion/training/train.py
+    params:
+      - training.lr
+      - training.batch_size
+      - training.num_epochs
+      - training.ema_decay
+      - model.base_channels
+      - model.channel_mult
+      - model.num_res_blocks
+      - model.attention_resolutions
+      - model.cfg_dropout
+      - schedule.T
+      - schedule.type
+      - seed
+    outs:
+      - outputs/checkpoints/best.pt
+        # WHY only `best.pt` here, not every periodic checkpoint:
+        # DVC pipeline outs are meant to be THE deliverable of a stage —
+        # the one checkpoint that downstream stages (evaluate, quantize)
+        # actually depend on. Periodic checkpoints during training are
+        # logged separately via plain `dvc add` calls from inside the
+        # training loop itself (see training.py's checkpoint saving
+        # logic) — those exist for resumability, not as pipeline outputs.
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 4 — EVALUATION
+  # ───────────────────────────────────────────────────────────────────────
+  # WHY THIS RERUNS ONLY WHEN THE MODEL CHANGES (per the original project
+  # plan's explicit requirement): because `outputs/checkpoints/best.pt`
+  # is a `deps:` entry here, DVC automatically skips re-running expensive
+  # FID computation and sampler comparisons unless the checkpoint's hash
+  # actually changed since the last `dvc repro`. This is the DAG dependency
+  # tracking doing exactly what it's for — no manual "did the model change"
+  # bookkeeping required.
+  evaluate:
+    cmd: python scripts/evaluate.py
+    deps:
+      - scripts/evaluate.py
+      - outputs/checkpoints/best.pt
+      - src/tiny_diffusion/diffusion/ddpm_sampler.py
+      - src/tiny_diffusion/diffusion/ddim_sampler.py
+      - src/tiny_diffusion/evaluation/fid.py
+    params:
+      - evaluation.num_samples_fid
+      - evaluation.ddim_steps_list
+      - evaluation.cfg_guidance_scale
+    outs:
+      - outputs/samples/eval_grid.png
+    metrics:
+      - outputs/eval_metrics.json:
+          cache: false
+          # WHY cache:false specifically here (the one metrics exception):
+          # this small JSON (FID scores per sampler config) is genuinely
+          # useful to diff with `dvc metrics diff` between git commits in
+          # CI (Phase 7) — that specific DVC feature requires the metrics
+          # file to be git-tracked directly, not stored in the DVC cache.
+          # This is the one deliberate exception to "DVC owns big binaries,
+          # MLflow owns metrics" — small comparison JSONs for CI diffing
+          # are the one case where both makes sense.
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 5 — QUANTIZATION
+  # ───────────────────────────────────────────────────────────────────────
+  # This is Phase 5's actual content — defined here now so the DAG shape
+  # is correct from the start, even though we won't fill in the real
+  # quantization logic until we reach that phase.
+  quantize:
+    cmd: python scripts/quantize.py
+    deps:
+      - scripts/quantize.py
+      - outputs/checkpoints/best.pt
+      - src/tiny_diffusion/quantization
+    params:
+      - quantization.methods
+      - quantization.calibration_samples
+    outs:
+      - outputs/quantized_models
+
+  # ───────────────────────────────────────────────────────────────────────
+  # STAGE 6 — BENCHMARKING
+  # ───────────────────────────────────────────────────────────────────────
+  # WHY THIS IS SEPARATE FROM quantize: quantization (producing the
+  # quantized model files) and benchmarking (measuring latency/FID/memory
+  # for each variant) are conceptually different operations with different
+  # rerun triggers — you might want to re-benchmark on a different machine
+  # without re-running quantization itself.
+  benchmark:
+    cmd: python scripts/benchmark_quantization.py
+    deps:
+      - scripts/benchmark_quantization.py
+      - outputs/quantized_models
+      - src/tiny_diffusion/evaluation/fid.py
+    metrics:
+      - outputs/quantization_results.json:
+          cache: false
+          # Same cache:false reasoning as the evaluate stage's metrics —
+          # this is the auto-generated comparison table (Phase 5's
+          # "results table auto-generated from MLflow query" requirement)
+          # and we want it git-diffable across commits.
