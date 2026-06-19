@@ -10,6 +10,8 @@
 !/outputs/samples/.gitkeep
 !/outputs/quantized_models/.gitkeep
 *.dvc
+!.dvc
+!.dvc/*
 !/*.dvc.yaml
 
 # ── Python ───────────────────────────────────────────────────────────────
