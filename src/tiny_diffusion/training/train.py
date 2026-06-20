@@ -161,6 +161,75 @@ def generate_sample_grid(
     return denormalize(x, normalize_mean, normalize_std)
 
 
+def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
+    """
+    Find the most recent checkpoint by step number, for automatic resume.
+
+    WHY THIS EXISTS — THE REAL PROBLEM IT SOLVES:
+    Kaggle sessions cap around 9-12 hours, Colab disconnects even sooner
+    on the free tier. Our measured epoch time (~5.4 min) times 200 epochs
+    is ~18 hours — meaning a SINGLE session cannot complete training.
+    Without resume, every session timeout means losing all progress and
+    restarting global_step=0 with fresh random weights. This function is
+    the first piece of making "train across multiple sessions" actually
+    work rather than just being a plan we hoped would pan out.
+    """
+    if not checkpoint_dir.exists():
+        return None
+    checkpoints = sorted(
+        checkpoint_dir.glob("step_*.pt"),
+        key=lambda p: int(p.stem.split("_")[1]),
+    )
+    return checkpoints[-1] if checkpoints else None
+
+
+def load_checkpoint_for_resume(
+    checkpoint_path: Path,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    ema: EMA,
+    device: torch.device,
+) -> Tuple[int, int]:
+    """
+    Restore full training state from a checkpoint — not just model
+    weights, but optimizer state (Adam's momentum/variance buffers) and
+    EMA shadow weights too.
+
+    WHY RESTORING OPTIMIZER STATE MATTERS (a subtle but real correctness
+    issue): if you only reload model weights and start a FRESH AdamW
+    optimizer, Adam's per-parameter adaptive learning rate estimates
+    (the running mean/variance of gradients) reset to zero. This causes
+    a visible "bump" in the loss curve right after resume — effectively
+    a mini cold-start — even though the model weights themselves were
+    fine. Restoring optimizer.state_dict() avoids this discontinuity.
+
+    WHY RESTORING EMA STATE MATTERS: Phase 1's EMA class has its own
+    warmup schedule based on absolute step count (Phase 0 Section 8).
+    If we resumed with a FRESH EMA object, it would re-enter warmup mode
+    at step 0 even though the model is actually at step 50,000 — the EMA
+    shadow weights would temporarily diverge from a sensible running
+    average. Restoring ema.state_dict() (which includes the decay value,
+    though not the step count itself — see the note below) keeps this
+    consistent enough in practice since by the time you're resuming,
+    decay has already reached its asymptotic value.
+
+    Returns:
+        (global_step, epoch) to resume from
+    """
+    print(f"[train] resuming from checkpoint: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    ema.load_state_dict(checkpoint["ema_state_dict"])
+
+    global_step = checkpoint["global_step"]
+    epoch = checkpoint["epoch"]
+
+    print(f"[train] resumed at global_step={global_step}, epoch={epoch}")
+    return global_step, epoch
+
+
 def train(cfg: DictConfig) -> None:
     """
     The main training entry point. Called from scripts/train.py once
@@ -207,12 +276,41 @@ def train(cfg: DictConfig) -> None:
     # mechanism Phase 5's quantization study measures post-training, but
     # here applied DURING training for speed/memory headroom on T4/P100.
     use_amp = cfg.experiment.training.mixed_precision and device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     # ── MLflow run setup ───────────────────────────────────────────────────
     tracking.init_tracking(experiment_name="tiny-diffusion-cifar10")
 
     run_tags = dict(cfg.experiment.tags) if "tags" in cfg.experiment else {}
+
+    # ── Resume detection ────────────────────────────────────────────────────
+    # WHY THIS CHECK HAPPENS BEFORE tracking.start_run(): if we're resuming,
+    # we want the MLflow run tagged as a continuation so it's visually
+    # distinguishable in the DagsHub UI from a fresh run — otherwise a
+    # resumed run's loss curve would show a confusing discontinuity (jumping
+    # from step 50,000 with no steps 0-49,999 visible) with no indication
+    # why, since this would actually be a SEPARATE MLflow run ID continuing
+    # the SAME underlying model weights.
+    checkpoint_dir = Path("outputs/checkpoints")
+    resume_checkpoint = find_latest_checkpoint(checkpoint_dir)
+
+    if resume_checkpoint is not None:
+        # WHY CHECKING `resume_checkpoint is not None` DIRECTLY, RATHER
+        # THAN A SEPARATE is_resuming BOOLEAN: mypy can statically narrow
+        # Optional[Path] to Path within this branch because the check is
+        # directly on the variable itself — a separate `is_resuming =
+        # resume_checkpoint is not None` boolean carries the same logical
+        # information at runtime but mypy cannot follow that link across
+        # two different variables, and flags every later access to
+        # resume_checkpoint as "might still be None" even though it can't
+        # be. This was a real mypy finding (not a runtime bug) caught
+        # when wiring resume logic into a fresh Kaggle session — fixed by
+        # checking the Optional variable directly instead of through an
+        # intermediate boolean.
+        run_tags["resumed_from"] = resume_checkpoint.name
+        print(f"[train] found existing checkpoint, will resume: {resume_checkpoint}")
+    else:
+        print("[train] no existing checkpoint found, starting fresh")
 
     with tracking.start_run(run_name=cfg.experiment.experiment_name, tags=run_tags):
         tracking.log_config(model_config.to_dict(), prefix="model.")
@@ -229,7 +327,19 @@ def train(cfg: DictConfig) -> None:
         tracking.log_seed(cfg.experiment.seed)
 
         # ── Training state ───────────────────────────────────────────────
-        global_step = 0
+        # WHY global_step/start_epoch ARE CONDITIONAL ON is_resuming:
+        # this is the actual fix for the 18hr-training-across-multiple-
+        # sessions problem. Without this, every new session would silently
+        # restart at step 0 with FRESH random weights, discarding all
+        # prior GPU-hours of progress the moment a Kaggle/Colab session
+        # disconnects — exactly the failure mode we're avoiding here.
+        if resume_checkpoint is not None:
+            global_step, start_epoch = load_checkpoint_for_resume(
+                resume_checkpoint, model, optimizer, ema, device
+            )
+        else:
+            global_step = 0
+            start_epoch = 0
         # NOTE: "save checkpoint as best-by-FID" tracking (the
         # outputs/checkpoints/best.pt that dvc.yaml's evaluate stage
         # depends on) is intentionally NOT implemented yet — it needs a
@@ -254,7 +364,20 @@ def train(cfg: DictConfig) -> None:
             f"[train] starting training: {num_epochs} epochs, " f"{len(train_loader)} steps/epoch"
         )
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
+            # NOTE: resume granularity is per-EPOCH, not per-batch. If a
+            # session ends mid-epoch, the checkpoint stores the epoch
+            # index but not which batch within it we'd reached. On
+            # resume, we restart that epoch from its first batch. This
+            # means a resumed run sees a partially-repeated epoch's worth
+            # of data — an honest, acceptable compromise (not a silent
+            # bug) given that: (1) optimizer and EMA state correctly
+            # carry over, so this isn't a cold-restart, (2) augmentation
+            # re-randomizes every time, so it's not pixel-identical
+            # repeated data, and (3) one repeated epoch out of 200 is
+            # negligible. True per-batch resume would require checkpointing
+            # the DataLoader's internal iteration state, which adds
+            # significant complexity for a marginal benefit at our scale.
             epoch_start_time = time.time()
 
             for batch_idx, (images, labels) in enumerate(train_loader):
@@ -275,7 +398,7 @@ def train(cfg: DictConfig) -> None:
                 # ── Forward pass + loss (Phase 0 Section 3) ─────────────────
                 optimizer.zero_grad(set_to_none=True)
 
-                with torch.cuda.amp.autocast(enabled=use_amp):
+                with torch.amp.autocast("cuda", enabled=use_amp):
                     noise_pred = model(x_t, t, labels)
                     loss = F.mse_loss(noise_pred, noise)
                     # ^ this single line IS Phase 0's entire L_simple —
