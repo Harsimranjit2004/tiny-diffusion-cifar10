@@ -87,17 +87,15 @@ THE EXPERIMENT SCHEMA — what we log, and why each category exists:
 
 import os
 import subprocess
-import time
-from dataclasses import dataclass, asdict
-from pathlib import Path
-from typing import Optional, Dict, Any
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 import mlflow
-
 
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
+
 
 @dataclass
 class TrackingConfig:
@@ -106,7 +104,8 @@ class TrackingConfig:
     'what to log every 10 steps / 100 steps / epoch' structure from
     the original project plan.
     """
-    log_step_metrics_every: int = 10     # loss, grad_norm — cheap, log often
+
+    log_step_metrics_every: int = 10  # loss, grad_norm — cheap, log often
     log_system_metrics_every: int = 100  # GPU util/mem — slightly more overhead
     # FID + sample grids happen once per epoch in the training loop itself,
     # not on a step-count interval, so there's no field for that here.
@@ -115,6 +114,7 @@ class TrackingConfig:
 # =============================================================================
 # INITIALIZATION
 # =============================================================================
+
 
 def get_git_commit_hash() -> str:
     """
@@ -129,7 +129,9 @@ def get_git_commit_hash() -> str:
     try:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         commit_hash = result.stdout.strip()
 
@@ -137,7 +139,9 @@ def get_git_commit_hash() -> str:
         # the commit hash alone doesn't fully describe what code actually ran.
         dirty_check = subprocess.run(
             ["git", "status", "--porcelain"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         is_dirty = len(dirty_check.stdout.strip()) > 0
 
@@ -180,10 +184,11 @@ def init_tracking(experiment_name: str = "tiny-diffusion-cifar10") -> None:
 # RUN LIFECYCLE
 # =============================================================================
 
+
 def start_run(
     run_name: str,
     tags: Optional[Dict[str, str]] = None,
-):
+) -> "mlflow.ActiveRun":
     """
     Start a new MLflow run. Returns the MLflow run context manager —
     use this with `with start_run(...) as run:` in training scripts.
@@ -207,6 +212,7 @@ def start_run(
 # =============================================================================
 # LOGGING: PARAMS (once per run)
 # =============================================================================
+
 
 def log_config(config_dict: Dict[str, Any], prefix: str = "") -> None:
     """
@@ -240,6 +246,7 @@ def log_seed(seed: int) -> None:
 # =============================================================================
 # LOGGING: STEP-LEVEL METRICS (every N steps)
 # =============================================================================
+
 
 def log_step_metrics(
     step: int,
@@ -284,8 +291,9 @@ def log_step_metrics(
     mlflow.log_metrics(metrics, step=step)
 
 
-def detect_instability(grad_norm: float, grad_norm_history: list,
-                       spike_threshold: float = 4.0) -> bool:
+def detect_instability(
+    grad_norm: float, grad_norm_history: list, spike_threshold: float = 4.0
+) -> bool:
     """
     Automatic gradient norm spike detection — flags potential training
     instability without requiring a human to stare at a chart in real time.
@@ -310,6 +318,7 @@ def detect_instability(grad_norm: float, grad_norm_history: list,
         return False
 
     import statistics
+
     mean = statistics.mean(grad_norm_history)
     stdev = statistics.stdev(grad_norm_history) if len(grad_norm_history) > 1 else 0
 
@@ -317,12 +326,13 @@ def detect_instability(grad_norm: float, grad_norm_history: list,
         return False
 
     z_score = (grad_norm - mean) / stdev
-    return z_score > spike_threshold
+    return bool(z_score > spike_threshold)
 
 
 # =============================================================================
 # LOGGING: SYSTEM METRICS (every N steps)
 # =============================================================================
+
 
 def get_gpu_metrics() -> Dict[str, float]:
     """
@@ -339,6 +349,7 @@ def get_gpu_metrics() -> Dict[str, float]:
     """
     try:
         import torch
+
         if not torch.cuda.is_available():
             return {}
 
@@ -351,6 +362,7 @@ def get_gpu_metrics() -> Dict[str, float]:
         utilization_pct = None
         try:
             import pynvml
+
             pynvml.nvmlInit()
             handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             util = pynvml.nvmlDeviceGetUtilizationRates(handle)
@@ -384,6 +396,7 @@ def log_system_metrics(step: int, iteration_time_sec: float) -> None:
 # =============================================================================
 # LOGGING: EPOCH-LEVEL METRICS (once per epoch — expensive)
 # =============================================================================
+
 
 def log_epoch_metrics(
     epoch: int,
@@ -424,6 +437,7 @@ def log_sample_grid(image_path: str, epoch: int) -> None:
 # LOGGING: ARTIFACTS (checkpoints, plots, schedule visualization)
 # =============================================================================
 
+
 def log_checkpoint(checkpoint_path: str, step: int) -> None:
     """
     Log a model checkpoint file as an MLflow artifact.
@@ -453,7 +467,8 @@ def log_noise_schedule_plot(plot_path: str) -> None:
 # SMOKE TEST — verify the whole module works end to end
 # =============================================================================
 
-def run_smoke_test():
+
+def run_smoke_test() -> None:
     """
     Minimal end-to-end test: init tracking, start a run, log a few
     params and metrics, end the run. Run this FIRST after setting up
@@ -505,7 +520,7 @@ def run_smoke_test():
         is_unstable = detect_instability(grad_norm=50.0, grad_norm_history=grad_norm_history)
         print(f"[smoke test] Instability detection test (forced spike): {is_unstable}")
 
-        print(f"\n[smoke test] Run URL: check your DagsHub repo's Experiments tab")
+        print("\n[smoke test] Run URL: check your DagsHub repo's Experiments tab")
         print(f"[smoke test] Run ID: {run.info.run_id}")
 
     print("\n" + "=" * 70)

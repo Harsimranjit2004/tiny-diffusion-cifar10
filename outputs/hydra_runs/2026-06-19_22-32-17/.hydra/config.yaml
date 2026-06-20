@@ -1,0 +1,60 @@
+experiment:
+  model:
+    base_channels: 128
+    channel_mult:
+    - 1
+    - 2
+    - 4
+    - 8
+    num_res_blocks: 2
+    attention_resolutions:
+    - 8
+    - 4
+    num_heads: 4
+    time_embed_dim: 512
+    num_classes: 10
+    cfg_dropout: 0.15
+    num_groups: 32
+    in_channels: 3
+    out_channels: 3
+    image_size: 32
+  training:
+    lr: 0.0002
+    batch_size: 128
+    num_epochs: 200
+    optimizer: adamw
+    weight_decay: 0.0
+    adam_beta1: 0.9
+    adam_beta2: 0.999
+    ema_decay: 0.9999
+    mixed_precision: true
+    grad_clip_norm: 1.0
+    checkpoint_every_n_steps: 1000
+    keep_last_n_checkpoints: 3
+    log_step_metrics_every: 10
+    log_system_metrics_every: 100
+  data:
+    dataset_name: cifar10
+    data_dir: data/processed/cifar10_tensors.pt
+    normalize_mean:
+    - 0.4914
+    - 0.4822
+    - 0.4465
+    normalize_std:
+    - 0.247
+    - 0.2435
+    - 0.2616
+    random_horizontal_flip: true
+    random_crop_padding: 4
+    num_workers: 2
+    pin_memory: true
+  schedule:
+    type: cosine
+    T: 1000
+    cosine_s: 0.008
+  experiment_name: baseline_55M_cosine_t1000
+  seed: 42
+  tags:
+    architecture_variant: baseline
+    quantization_level: fp32
+    sampler_type: ddpm

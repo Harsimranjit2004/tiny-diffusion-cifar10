@@ -1,0 +1,90 @@
+# .pre-commit-config.yaml
+#
+# WHAT THIS FILE DOES: defines hooks that run automatically on `git commit`,
+# BEFORE the commit is actually created. If any hook fails or modifies files
+# (e.g. black reformats a file), the commit is blocked until you re-stage
+# the now-formatted files and commit again. This is what makes code quality
+# automatic rather than aspirational — you cannot accidentally commit
+# unformatted or badly-typed code once this is installed.
+#
+# WHY THESE FOUR TOOLS SPECIFICALLY, IN THIS ORDER:
+#   1. black   — formats code (line length, quote style, spacing). Runs
+#                FIRST because isort/flake8 should see already-formatted
+#                code, not fight black over formatting opinions.
+#   2. isort   — sorts and groups imports (stdlib, third-party, local).
+#                Configured with profile=black (Step 1's pyproject.toml)
+#                specifically so it never produces a diff black would
+#                then want to reformat — they're tuned to agree.
+#   3. flake8  — lints for actual bugs and style violations black doesn't
+#                fix (unused imports, undefined names, line-too-complex).
+#                Runs after formatting so it's not flagging things black
+#                would've fixed anyway.
+#   4. mypy    — static type checking. Runs LAST and separately because
+#                it's the slowest hook by far (analyzes the full type
+#                graph) — fast hooks first means a quick `black` failure
+#                doesn't wait behind a slow mypy run that would've failed
+#                anyway.
+#
+# HOW TO ACTUALLY ACTIVATE THIS (not automatic just by having the file):
+#   pip install pre-commit   (already in requirements.txt from Step 1)
+#   pre-commit install       (registers the git hook — ONE-TIME per clone)
+
+repos:
+  - repo: https://github.com/psf/black
+    rev: 24.4.2
+    hooks:
+      - id: black
+        language_version: python3.11
+
+  - repo: https://github.com/PyCQA/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+
+  - repo: https://github.com/PyCQA/flake8
+    rev: 7.1.0
+    hooks:
+      - id: flake8
+        # WHY max-line-length=100 here too (not just relying on a setup.cfg):
+        # flake8, unlike black/isort/mypy, does NOT read pyproject.toml by
+        # default (a long-standing flake8 limitation) — so we pass the
+        # matching line-length directly as an arg, keeping it consistent
+        # with black's line-length=100 from Step 1's pyproject.toml.
+        args: ["--max-line-length=100", "--extend-ignore=E203,W503"]
+        # E203/W503 ignored: these two rules actively CONFLICT with black's
+        # formatting choices (black adds whitespace before ':' in slices,
+        # and puts binary operators at the start of wrapped lines) — this
+        # is black's own officially documented flake8 compatibility config.
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.10.1
+    hooks:
+      - id: mypy
+        additional_dependencies: [types-PyYAML]
+        # WHY exclude tests/ from mypy: test files often use dynamic
+        # patterns (fixtures, parametrize) that are awkward to fully type
+        # and provide little safety benefit relative to the friction —
+        # standard pragmatic exclusion across most Python projects.
+        exclude: ^tests/
+
+  # ── Generic file hygiene hooks (no separate tool config needed) ──────────
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # WHY check-yaml matters specifically for us: we have a LOT of
+        # YAML now (Hydra configs, dvc.yaml, params.yaml). A syntax error
+        # in any of these currently only surfaces when you actually run
+        # train.py or dvc repro — this hook catches it at commit time
+        # instead, before it's even pushed.
+      - id: check-added-large-files
+        args: ["--maxkb=5000"]
+        # WHY 5MB specifically: this is a safety net against accidentally
+        # `git add`-ing a checkpoint or dataset file that should have gone
+        # through DVC instead (Step 1/3's entire reasoning for why those
+        # are gitignored in the first place) — 5MB comfortably allows
+        # normal code/config files through while catching the mistake of
+        # adding a stray .pt or .npz file directly to git.
+      - id: check-merge-conflict
