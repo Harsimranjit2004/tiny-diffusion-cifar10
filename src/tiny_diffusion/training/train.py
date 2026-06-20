@@ -36,6 +36,12 @@ from tiny_diffusion.diffusion.schedule import CosineNoiseSchedule
 from tiny_diffusion.models.config import ModelConfig
 from tiny_diffusion.models.ema import EMA
 from tiny_diffusion.models.unet import UNet
+from tiny_diffusion.training.checkpoint import (
+    cleanup_old_checkpoints,
+    dvc_add_checkpoint,
+    dvc_pull_latest_checkpoint,
+    dvc_push_checkpoint,
+)
 from tiny_diffusion.utils import tracking
 from tiny_diffusion.utils.seed import set_seed
 
@@ -292,6 +298,18 @@ def train(cfg: DictConfig) -> None:
     # why, since this would actually be a SEPARATE MLflow run ID continuing
     # the SAME underlying model weights.
     checkpoint_dir = Path("outputs/checkpoints")
+
+    # ── Pull any checkpoint that survived from a PREVIOUS session ────────
+    # WHY THIS MUST HAPPEN BEFORE find_latest_checkpoint(): Kaggle/Colab
+    # wipe local disk between sessions — a checkpoint saved and DVC-pushed
+    # on a prior day exists only on the DVC remote (Google Drive) at the
+    # start of a fresh session, not on local disk. Without this pull,
+    # find_latest_checkpoint() would correctly report "nothing found" even
+    # though a checkpoint genuinely exists — just not locally yet. This
+    # gap was caught before any multi-day GPU time was spent relying on it.
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    dvc_pull_latest_checkpoint(checkpoint_dir)
+
     resume_checkpoint = find_latest_checkpoint(checkpoint_dir)
 
     if resume_checkpoint is not None:
@@ -349,6 +367,7 @@ def train(cfg: DictConfig) -> None:
         # dead placeholder in the meantime (flake8 correctly flagged the
         # earlier unused `best_fid = float("inf")` line as dead code).
         grad_norm_history: list = []
+        confirmed_pushed_checkpoints: set = set()
 
         num_epochs = cfg.experiment.training.num_epochs
         log_step_every = cfg.experiment.training.log_step_metrics_every
@@ -459,7 +478,7 @@ def train(cfg: DictConfig) -> None:
                     iter_time = time.time() - step_start_time
                     tracking.log_system_metrics(step=global_step, iteration_time_sec=iter_time)
 
-                # ── Periodic checkpointing (resumability, via DVC add) ──────
+                # ── Periodic checkpointing (resumability, via DVC add+push) ──
                 if global_step > 0 and global_step % checkpoint_every == 0:
                     ckpt_path = Path(f"outputs/checkpoints/step_{global_step:07d}.pt")
                     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -474,11 +493,54 @@ def train(cfg: DictConfig) -> None:
                         ckpt_path,
                     )
                     print(f"[train] saved checkpoint: {ckpt_path}")
-                    # NOTE: actually `dvc add`-ing this checkpoint is a
-                    # separate concern from training itself — see Phase 3's
-                    # checkpoint.py module for the DVC integration, kept
-                    # OUT of the hot training loop so a slow DVC operation
-                    # never blocks the next training step.
+
+                    # ── DVC add + push: makes this checkpoint survive a ──
+                    # session ending — WITHOUT this, the checkpoint exists
+                    # ONLY on this session's local (ephemeral) disk and is
+                    # lost the moment the Kaggle/Colab session ends. This
+                    # IS a real, visible stall on the training loop (DVC
+                    # has to hash + upload the file over the network) —
+                    # an honest, accepted cost given that cross-session
+                    # persistence is the entire point of checkpointing in
+                    # the first place for an 18hr-across-multiple-sessions
+                    # training plan. add/push failures warn loudly (see
+                    # checkpoint.py) but never raise — a flaky network
+                    # blip should not crash hours of training progress
+                    # that's still safely on local disk even if the DVC
+                    # push itself failed this one time.
+                    add_ok = dvc_add_checkpoint(ckpt_path)
+                    if add_ok:
+                        push_ok = dvc_push_checkpoint(ckpt_path)
+                        if push_ok:
+                            confirmed_pushed_checkpoints.add(str(ckpt_path))
+
+                    # ── Disk space cleanup — THE BUG THIS FIXES ──────────
+                    # WHY THIS IS NOT OPTIONAL: checkpoint.py's
+                    # cleanup_old_checkpoints() was written back when we
+                    # first built checkpoint.py, but never actually wired
+                    # into the live training loop until now. Each
+                    # checkpoint here is ~0.88GB (model 0.22GB + AdamW
+                    # optimizer state 0.44GB, since Adam stores momentum
+                    # AND variance per parameter + EMA shadow 0.22GB) —
+                    # NOT the ~220MB originally estimated (that only
+                    # counted model weights). Without this cleanup call,
+                    # checkpoints accumulate uncapped on Kaggle's limited
+                    # local disk. This caused a REAL crash during Phase 3's
+                    # first full baseline run: after ~5 accumulated
+                    # checkpoints (~4.4GB), torch.save() failed mid-write
+                    # with a corrupted-file error consistent with the disk
+                    # running out of space at that exact moment, 14 epochs
+                    # into what would have been an 18-hour run. We only
+                    # ever delete a checkpoint that's in
+                    # confirmed_pushed_checkpoints — i.e. dvc push
+                    # ACTUALLY succeeded for it, not merely that dvc add
+                    # succeeded (a real distinction — see checkpoint.py's
+                    # docstring for the gap this closes).
+                    cleanup_old_checkpoints(
+                        checkpoint_dir,
+                        keep_last_n=3,
+                        confirmed_pushed=confirmed_pushed_checkpoints,
+                    )
 
                 global_step += 1
 
