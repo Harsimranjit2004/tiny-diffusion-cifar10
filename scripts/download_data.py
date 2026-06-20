@@ -3,30 +3,24 @@ scripts/download_data.py
 
 PHASE 3 — DVC data_download STAGE
 
-WHAT THIS SCRIPT DOES: downloads CIFAR-10 to data/raw/ via torchvision's
-built-in downloader. This is intentionally the THINNEST possible script —
-its only job is to trigger the download, matching exactly what dvc.yaml's
-data_download stage declares as its output path
-(data/raw/cifar-10-batches-py).
-
-WHY THIS IS SEPARATE FROM cifar10.py's CIFAR10Diffusion class (which also
-has download=True as a default): that class downloads AS A SIDE EFFECT of
-being instantiated for training. This script exists so `dvc repro` can
-invoke JUST the download step in isolation, satisfying the DAG dependency
-declared in dvc.yaml, without needing to construct a full Dataset object
-with transforms that aren't relevant to "did the raw files arrive."
+WHY THIS USES THE HUGGING FACE MIRROR (uoft-cs/cifar10) INSTEAD OF
+torchvision.datasets.CIFAR10's DIRECT DOWNLOAD: discovered during Phase
+3's first real GPU smoke test — the original University of Toronto host
+was measured at ~24-68 kB/s on both Kaggle and Colab (nearly 2 hours for
+170MB), while the identical dataset on Hugging Face's CDN downloads in
+~2 seconds at 50+ MB/s in the same sessions. See src/tiny_diffusion/data/
+cifar10.py's module docstring for the full reasoning — this script just
+needs to trigger the same download path so DVC's data_download stage
+output exists before the preprocess stage runs.
 """
 
-import torchvision
+from datasets import load_dataset
 
 
 def main() -> None:
-    print("Downloading CIFAR-10 to data/raw/ ...")
-    # download=True triggers the fetch if not already present; if the
-    # files already exist (e.g. DVC pulled them from the remote), this
-    # is a fast no-op verification rather than a redundant re-download.
-    torchvision.datasets.CIFAR10(root="data/raw", train=True, download=True)
-    torchvision.datasets.CIFAR10(root="data/raw", train=False, download=True)
+    print("Downloading CIFAR-10 (Hugging Face mirror: uoft-cs/cifar10) to data/raw/ ...")
+    load_dataset("uoft-cs/cifar10", split="train", cache_dir="data/raw")
+    load_dataset("uoft-cs/cifar10", split="test", cache_dir="data/raw")
     print("Done.")
 
 

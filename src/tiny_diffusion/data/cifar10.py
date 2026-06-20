@@ -15,46 +15,45 @@ WHY NORMALIZATION VALUES ARE THESE SPECIFIC NUMBERS:
   reproduce the same numbers at the cost of an extra dataset pass) — see
   configs/data/cifar10.yaml's comment on this exact point.
 
-WHY WE NORMALIZE TO ROUGHLY [-1, 1] RATHER THAN [0, 1]:
-  Diffusion models add Gaussian noise ε ~ N(0,1) directly to the image
-  tensor (Phase 0's forward process: x_t = sqrt(abar)*x_0 + sqrt(1-abar)*ε).
-  For this addition to make sense, x_0 should live on a similar SCALE to
-  the noise — values centered near 0 with unit-ish variance, not values
-  in [0,1] which would make the early, low-noise timesteps add disproportionately
-  large perturbations relative to the signal's own scale. Standard practice
-  across all diffusion papers: normalize images to mean~0.
-
-WHY AUGMENTATION HAPPENS HERE, NOT IN THE DVC preprocess STAGE:
-  Phase 2 Step 3's dvc.yaml comment on the preprocess stage already
-  explained this: random crop and flip must be RE-RANDOMIZED every epoch.
-  Precomputing them once would mean training sees the same augmented
-  version of each image every single epoch — defeating the entire purpose
-  of augmentation (forcing the model to generalize past exact pixel
-  patterns). Only deterministic preprocessing (normalization stats) is
-  precomputed and cached.
+WHY WE LOAD VIA HUGGING FACE'S `datasets` LIBRARY INSTEAD OF
+torchvision.datasets.CIFAR10's DIRECT DOWNLOAD:
+  torchvision's CIFAR10 downloads directly from www.cs.toronto.edu — the
+  original academic host. In practice (discovered during Phase 3's first
+  real GPU smoke test) this host can be extremely slow or rate-limited —
+  we measured ~24-68 kB/s on both Kaggle and Colab, which would take
+  nearly 2 hours just to fetch a 170MB file. The identical dataset, byte-
+  for-byte equivalent in content, is mirrored on Hugging Face's CDN
+  (uoft-cs/cifar10) and downloaded in ~2 seconds at 50+ MB/s in the same
+  sessions. We switch the DATA SOURCE only — everything downstream (the
+  transform pipeline, normalization, augmentation, the public
+  CIFAR10Diffusion/get_dataloader/denormalize interface) is UNCHANGED,
+  so no other file in this codebase needs to know this switch happened.
 """
 
 from typing import Tuple
 
 import torch
-import torchvision
 import torchvision.transforms as T
+from datasets import load_dataset
 from torch.utils.data import DataLoader, Dataset
 
 
 class CIFAR10Diffusion(Dataset):
     """
-    Wraps torchvision's CIFAR10 dataset with diffusion-appropriate
-    normalization and the CFG-compatible label scheme.
+    Wraps the Hugging Face uoft-cs/cifar10 dataset with diffusion-
+    appropriate normalization and the CFG-compatible label scheme.
 
-    WHY WE WRAP RATHER THAN USE torchvision.datasets.CIFAR10 DIRECTLY:
-    torchvision's labels are 0-9. Our ClassEmbedding table (Phase 1) has
-    11 entries (0-9 real classes + index 10 for the CFG null token). The
-    dataset itself should never produce label 10 — that's something
-    ClassEmbedding's forward() injects at TRAINING TIME via random dropout
-    (Phase 1's cfg_dropout logic), not something baked into the data. This
-    wrapper exists mainly to centralize the transform pipeline in one
-    place rather than scattering transform logic across train.py.
+    WHY WE WRAP RATHER THAN USE THE HF DATASET OBJECT DIRECTLY:
+    HF's dataset returns dicts with 'img' (PIL Image) and 'label' (int,
+    0-9) keys per example — not directly compatible with PyTorch's
+    DataLoader, which expects __getitem__ to return a fixed-shape
+    tuple. Our ClassEmbedding table (Phase 1) has 11 entries (0-9 real
+    classes + index 10 for the CFG null token); the dataset itself
+    should never produce label 10 — that's something ClassEmbedding's
+    forward() injects at TRAINING TIME via random dropout (Phase 1's
+    cfg_dropout logic), not something baked into the data. This wrapper
+    centralizes the transform pipeline in one place rather than
+    scattering transform logic across train.py.
     """
 
     def __init__(
@@ -106,13 +105,23 @@ class CIFAR10Diffusion(Dataset):
 
         self.transform = T.Compose(transform_list)
 
-        self.dataset = torchvision.datasets.CIFAR10(root=root, train=train, download=download)
+        # ── Load from the fast Hugging Face mirror ─────────────────────────
+        # split="train" / "test" matches HF's DatasetDict structure exactly
+        # (confirmed via Phase 3's smoke test: 50000 train, 10000 test rows).
+        # cache_dir=root reuses our existing data/raw/ folder so DVC's
+        # data_download stage output path (Phase 2 Step 3's dvc.yaml)
+        # still points somewhere meaningful, even though the actual files
+        # HF caches there have a different internal layout than torchvision's.
+        split = "train" if train else "test"
+        self.dataset = load_dataset("uoft-cs/cifar10", split=split, cache_dir=root)
 
     def __len__(self) -> int:
         return len(self.dataset)
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, int]:
-        image, label = self.dataset[idx]  # PIL image, int label (0-9)
+        example = self.dataset[idx]
+        image = example["img"]  # PIL image
+        label = example["label"]  # int, 0-9
         image = self.transform(image)
         return image, label
 
