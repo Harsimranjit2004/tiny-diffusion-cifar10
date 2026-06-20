@@ -1,0 +1,13 @@
+# configs/schedule/cosine.yaml
+#
+# WHY THIS IS ITS OWN CONFIG GROUP: Phase 0 derived and compared two
+# schedules (linear vs cosine) as a genuine design decision, not just a
+# hyperparameter. Giving schedule its own config group means we can keep
+# BOTH configs/schedule/cosine.yaml (our chosen default) AND a
+# configs/schedule/linear.yaml sitting alongside it for the ablation that
+# reproduces Phase 0's reasoning empirically, without duplicating every
+# other config just to test one schedule difference.
+
+type: cosine
+T: 1000
+cosine_s: 0.008

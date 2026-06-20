@@ -1,0 +1,23 @@
+# configs/data/cifar10.yaml
+#
+# Dataset configuration: where it lives, normalization stats, augmentation.
+# WHY normalize_mean/std are hardcoded CIFAR-10 constants rather than
+# computed at runtime: these are well-known, widely-published per-channel
+# statistics for CIFAR-10 specifically — computing them fresh each run
+# would just reproduce the same numbers at the cost of an extra pass over
+# the dataset. If we ever swap datasets, this file is what changes.
+
+dataset_name: cifar10
+data_dir: data/processed/cifar10_tensors.pt
+
+normalize_mean: [0.4914, 0.4822, 0.4465]
+normalize_std: [0.2470, 0.2435, 0.2616]
+
+# Augmentation — applied LIVE in the DataLoader during training (Phase 2
+# Step 3's dvc.yaml comment on the preprocess stage explains why these
+# can't be precomputed: they must be re-randomized every epoch).
+random_horizontal_flip: true
+random_crop_padding: 4   # standard CIFAR-10 augmentation: pad 4px, random-crop back to 32x32
+
+num_workers: 2            # DataLoader workers — tune based on Kaggle/Colab CPU count
+pin_memory: true          # speeds up CPU->GPU transfer, see ML Systems textbook on this

@@ -1,0 +1,37 @@
+# configs/experiment/baseline.yaml
+#
+# THIS IS THE FILE YOU ACTUALLY RUN: `python scripts/train.py experiment=baseline`
+#
+# WHAT "defaults:" MEANS IN HYDRA: this is Hydra's composition mechanism.
+# Each line says "pull in this config GROUP's file and merge it into the
+# final resolved config." Hydra reads model/base.yaml, training/base.yaml,
+# data/cifar10.yaml, and schedule/cosine.yaml, and merges them all into
+# ONE config object accessible in train.py as cfg.model.base_channels,
+# cfg.training.lr, cfg.data.normalize_mean, cfg.schedule.T, etc.
+#
+# WHY THIS BEATS ONE GIANT YAML FILE: each config group (model, training,
+# data, schedule) can be swapped independently from the command line:
+#   python scripts/train.py experiment=baseline schedule=linear
+# reuses everything in this file EXCEPT schedule, which gets replaced
+# entirely by configs/schedule/linear.yaml. You get full factorial
+# combinations without writing N x M x K x L separate experiment files.
+
+defaults:
+  - /model: base
+  - /training: base
+  - /data: cifar10
+  - /schedule: cosine
+  - _self_
+
+# Anything defined directly here (not in defaults:) OVERRIDES whatever
+# the composed files say, scoped to JUST this experiment. We use this for
+# experiment-level metadata, not architecture/training values (those stay
+# in their respective config groups so they remain independently swappable).
+experiment_name: baseline_55M_cosine_t1000
+seed: 42
+
+# MLflow run tags (Phase 2 Step 2's tracking.py reads these directly)
+tags:
+  architecture_variant: baseline
+  quantization_level: fp32
+  sampler_type: ddpm

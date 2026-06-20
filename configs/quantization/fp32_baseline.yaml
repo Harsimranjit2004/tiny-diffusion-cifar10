@@ -1,0 +1,13 @@
+# configs/quantization/fp32_baseline.yaml
+#
+# WHY A "BASELINE" CONFIG EXISTS AT ALL: even fp32 (no quantization) is
+# expressed as a config variant here, not a special case in code. This
+# means the Phase 5 ablation study's five runs (fp32, fp16, int8 dynamic,
+# int8 static, QAT) are FIVE INSTANCES OF THE SAME CODE PATH with
+# different configs — not five different code branches. This is what
+# makes the comparison scientifically clean: identical code, only the
+# config differs, exactly like the rest of our ablations.
+
+method: fp32_baseline
+dtype: float32
+calibration_samples: null   # not needed — no calibration for fp32

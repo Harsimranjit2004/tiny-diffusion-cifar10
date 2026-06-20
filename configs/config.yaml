@@ -1,0 +1,28 @@
+# configs/config.yaml
+#
+# THE HYDRA ENTRY POINT. train.py's @hydra.main decorator points at this
+# file. WHY THIS FILE IS NEARLY EMPTY: its only job is to set the DEFAULT
+# experiment (so `python scripts/train.py` with zero args still runs
+# something sensible) and declare Hydra's own output directory behavior.
+# Everything else is delegated to configs/experiment/*.yaml composition.
+
+defaults:
+  - experiment: baseline
+  - _self_
+
+# Hydra's own run-output behavior — where Hydra puts its auto-generated
+# logs/config-snapshot for each run. We override the default
+# (outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}) to nest under OUR outputs/
+# folder structure rather than creating a competing top-level "outputs"
+# convention, since outputs/ already has a specific meaning in our project
+# (checkpoints/, samples/, quantized_models/ — see Phase 2 Step 1).
+hydra:
+  run:
+    dir: outputs/hydra_runs/${now:%Y-%m-%d_%H-%M-%S}
+  job:
+    chdir: false
+    # WHY chdir:false specifically: Hydra's default behavior changes the
+    # process's working directory to the run dir, which silently breaks
+    # any relative path in our code that assumes the project root (e.g.
+    # data/processed/cifar10_tensors.pt). Disabling this keeps paths
+    # predictable and matching what dvc.yaml's deps/outs expect.

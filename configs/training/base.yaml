@@ -1,0 +1,36 @@
+# configs/training/base.yaml
+#
+# Training hyperparameters: optimizer, scheduler, batch size, EMA, etc.
+# Kept separate from model.yaml because these two config groups vary
+# INDEPENDENTLY — you might sweep learning rate without touching
+# architecture, or vice versa. Hydra's config-group system is built
+# exactly for this kind of independent-axis composition.
+
+lr: 2e-4
+batch_size: 128
+num_epochs: 200
+
+optimizer: adamw
+weight_decay: 0.0
+adam_beta1: 0.9
+adam_beta2: 0.999
+
+# EMA settings — see Phase 1's EMA class for the warmup formula this feeds
+ema_decay: 0.9999
+
+# Mixed precision — fp16 autocast during training (NOT the same as the
+# fp16 QUANTIZATION variant in Phase 5 — this is training-time precision,
+# that's post-training inference precision. Easy naming confusion to avoid.)
+mixed_precision: true
+
+# Gradient clipping — caps grad_norm to prevent the instability spikes
+# that Phase 2 Step 2's detect_instability() function watches for.
+grad_clip_norm: 1.0
+
+# Checkpointing
+checkpoint_every_n_steps: 1000
+keep_last_n_checkpoints: 3
+
+# Logging frequency — feeds tracking.py's TrackingConfig
+log_step_metrics_every: 10
+log_system_metrics_every: 100

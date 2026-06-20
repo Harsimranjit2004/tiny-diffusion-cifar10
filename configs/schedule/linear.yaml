@@ -1,0 +1,12 @@
+# configs/schedule/linear.yaml
+#
+# The Phase 0 baseline-for-comparison schedule. Not our chosen default,
+# but kept as a real, runnable config so the "cosine vs linear at 32x32"
+# claim from Phase 0 can actually be empirically tested with one CLI flag:
+#   python scripts/train.py schedule=linear
+# rather than just asserted from theory.
+
+type: linear
+T: 1000
+beta_start: 0.0001
+beta_end: 0.02

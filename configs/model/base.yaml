@@ -1,0 +1,27 @@
+# configs/model/base.yaml
+#
+# WHAT THIS FILE IS: the architecture configuration, mirroring Phase 1's
+# ModelConfig dataclass fields exactly. This is the SINGLE SOURCE OF TRUTH
+# for architecture hyperparameters once Hydra is in place — train.py loads
+# THIS file (via Hydra's composition), not a hardcoded ModelConfig() call.
+#
+# WHY "base.yaml" AND NOT JUST "model.yaml":
+# We anticipate architecture VARIANTS later (e.g. a wider/narrower model
+# for ablation). Naming this "base" leaves room for "configs/model/wide.yaml"
+# or "configs/model/narrow.yaml" to exist alongside it, each overriding only
+# the fields that differ. This is the standard Hydra config-group pattern.
+
+base_channels: 128
+channel_mult: [1, 2, 4, 8]
+num_res_blocks: 2
+attention_resolutions: [8, 4]
+num_heads: 4
+
+time_embed_dim: 512
+num_classes: 10
+cfg_dropout: 0.15
+
+num_groups: 32
+in_channels: 3
+out_channels: 3
+image_size: 32
