@@ -87,6 +87,7 @@ CONTAINER_URI = "us-docker.pkg.dev/vertex-ai/training/pytorch-gpu.2-3.py310:late
 BUCKET_NAME = f"{PROJECT_ID}-checkpoints"
 STAGING_BUCKET = f"gs://{BUCKET_NAME}"
 CHECKPOINT_GCS_URI = f"gs://{BUCKET_NAME}/checkpoints/"
+MLFLOW_URI = "https://dagshub.com/Harsimranjit2004/tiny-diffusion-cifar10.mlflow"
 
 
 def ensure_bucket_exists(bucket_name: str, region: str) -> None:
@@ -120,20 +121,6 @@ def main() -> None:
             "MLFLOW_TRACKING_PASSWORD=<your-dagshub-token> python scripts/launch_vertex_training.py"
         )
 
-    # WHY DAGSHUB_TOKEN IS REQUIRED HERE TOO, SEPARATE FROM
-    # MLFLOW_TRACKING_PASSWORD: the SAME DagsHub token serves two
-    # different purposes in this project — authenticating MLflow
-    # tracking calls (MLFLOW_TRACKING_PASSWORD) AND authenticating the
-    # git clone scripts/train.py performs at runtime on Vertex AI
-    # (DAGSHUB_TOKEN). They happen to be the same literal token value
-    # in practice, but we pass them as two distinctly-named environment
-    # variables since they're conceptually different credentials used
-    # by different code paths (tracking.py vs train.py's clone logic) —
-    # this was a real gap that caused a `git clone` authentication
-    # failure on the first run after fixing the ModuleNotFoundError.
-    dagshub_token = os.environ.get("DAGSHUB_TOKEN", mlflow_password)
-    dagshub_username = os.environ.get("DAGSHUB_USERNAME", "Harsimranjit2004")
-
     aiplatform.init(
         project=PROJECT_ID,
         location=REGION,
@@ -162,29 +149,20 @@ def main() -> None:
         # principle from Phase 2 Step 2). We list everything else our
         # code needs beyond that base image.
         #
-        # WHY "." IS NOT IN THIS LIST (CONFIRMED BROKEN, NOT JUST
-        # UNCERTAIN): we tried adding "." here as a way to pip-install
-        # our own project inside the container, since pip normally
-        # accepts a local directory path as a requirement specifier.
-        # This FAILED on a real run with: "error in
-        # aiplatform_custom_trainer_script setup command: 'install_requires'
-        # must be a string or list of strings containing valid
-        # project/version requirement specifiers; Expected package name
-        # at the start of dependency specifier . ^". Root cause: Vertex
-        # AI's SDK generates its OWN wrapper setup.py internally and
-        # feeds this `requirements` list straight into that setup.py's
-        # install_requires field — which only accepts real PyPI-style
-        # package specifiers, never a local path. The actual fix for
-        # the ModuleNotFoundError this was meant to solve lives in
-        # scripts/train.py instead: it clones this project's own git
-        # repo at runtime (when running on Vertex AI specifically) and
-        # imports tiny_diffusion from that fresh clone — sidestepping
-        # Vertex AI's local-packaging behavior entirely rather than
-        # depending on any specific assumption about what gets staged
-        # alongside this single script_path file. See that file's
-        # module docstring for the full story, including an earlier
-        # sys.path-based attempt that was never verified and likely
-        # would have been broken for the same reason "." was.
+        # WHY "." IS IN THIS LIST (THE FIX FOR THE REAL FIRST-RUN BUG):
+        # CustomTrainingJob's script_path stages ONLY that single file
+        # into the container — it does NOT package and install the rest
+        # of the project the way SageMaker's source_dir parameter does.
+        # The first real run against actual GCP infrastructure failed
+        # with `ModuleNotFoundError: No module named 'tiny_diffusion'`
+        # because train.py's `from tiny_diffusion.training.train import
+        # train` had nothing to import — the package was never installed
+        # in the container. `requirements` is passed straight to pip,
+        # and pip accepts a local directory path as a requirement
+        # specifier (this is the documented mechanism for exactly this
+        # case — see pyproject.toml at the project root, which is what
+        # makes "." resolve to an installable package here, the same
+        # pyproject.toml that makes `pip install -e .` work locally).
         requirements=[
             "einops==0.8.0",
             "mlflow==2.14.1",
@@ -220,19 +198,9 @@ def main() -> None:
         replica_count=1,
         args=job_args,
         environment_variables={
-            "MLFLOW_TRACKING_URI": (
-                "https://dagshub.com/Harsimranjit2004/tiny-diffusion-cifar10.mlflow"
-            ),
+            "MLFLOW_TRACKING_URI": MLFLOW_URI,
             "MLFLOW_TRACKING_USERNAME": "Harsimranjit2004",
             "MLFLOW_TRACKING_PASSWORD": mlflow_password,
-            # WHY THESE TWO ARE NEEDED, SEPARATE FROM THE MLFLOW VARS
-            # ABOVE: scripts/train.py's _ensure_project_cloned() reads
-            # these specifically to authenticate the git clone it
-            # performs at runtime on Vertex AI — see that function's
-            # docstring for the full story of the `fatal: could not
-            # read Username` error this fixes.
-            "DAGSHUB_USERNAME": dagshub_username,
-            "DAGSHUB_TOKEN": dagshub_token,
             # WHY AIP_CHECKPOINT_DIR IS NOT SET HERE MANUALLY: Vertex AI
             # sets this automatically for every CustomTrainingJob based
             # on base_output_dir — we don't need to (and shouldn't)
