@@ -121,6 +121,9 @@ def main() -> None:
             "MLFLOW_TRACKING_PASSWORD=<your-dagshub-token> python scripts/launch_vertex_training.py"
         )
 
+    dagshub_token = os.environ.get("DAGSHUB_TOKEN", mlflow_password)
+    dagshub_username = os.environ.get("DAGSHUB_USERNAME", "Harsimranjit2004")
+
     aiplatform.init(
         project=PROJECT_ID,
         location=REGION,
@@ -201,6 +204,8 @@ def main() -> None:
             "MLFLOW_TRACKING_URI": MLFLOW_URI,
             "MLFLOW_TRACKING_USERNAME": "Harsimranjit2004",
             "MLFLOW_TRACKING_PASSWORD": mlflow_password,
+            "DAGSHUB_USERNAME": dagshub_username,
+            "DAGSHUB_TOKEN": dagshub_token,
             # WHY AIP_CHECKPOINT_DIR IS NOT SET HERE MANUALLY: Vertex AI
             # sets this automatically for every CustomTrainingJob based
             # on base_output_dir — we don't need to (and shouldn't)
