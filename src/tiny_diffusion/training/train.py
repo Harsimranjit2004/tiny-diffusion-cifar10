@@ -20,8 +20,29 @@ instability detection) that all happen on the same critical path every
 step. Splitting these into many tiny functions called once each would
 add indirection without adding clarity — this is a case where a longer,
 well-commented function is more readable than scattered abstraction.
+
+CHECKPOINT BACKEND — DVC (Kaggle/Colab/local) vs SAGEMAKER (native S3 sync):
+  After repeatedly fighting Google Drive's OAuth flow being fundamentally
+  incompatible with Kaggle's non-interactive "Save & Run All" batch mode
+  (a real, unresolved blocker — see the long debugging history that led
+  here), we added SageMaker Training Jobs as a parallel execution path.
+  SageMaker has a BUILT-IN checkpoint mechanism: any files written to
+  /opt/ml/checkpoints are automatically synced to S3 by SageMaker itself,
+  with zero OAuth, zero DVC, zero manual remote configuration. On job
+  restart (e.g. after a spot interruption), SageMaker automatically
+  downloads the S3 checkpoint contents back into that same local path
+  BEFORE your script even starts running.
+
+  We detect which environment we're in via the SM_TRAINING_ENV
+  environment variable (SageMaker sets this automatically in every
+  training job container; it is simply absent on Kaggle/Colab/local).
+  This lets the SAME train.py work correctly on both platforms without
+  maintaining two divergent training scripts — the only difference is
+  which checkpoint directory we write to and whether we call DVC's
+  add/push/pull functions at all.
 """
 
+import os
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -42,8 +63,27 @@ from tiny_diffusion.training.checkpoint import (
     dvc_pull_latest_checkpoint,
     dvc_push_checkpoint,
 )
+from tiny_diffusion.training.kaggle_checkpoint import (
+    is_running_on_kaggle,
+    restore_checkpoints_from_kaggle_dataset,
+    upload_checkpoints_to_kaggle_dataset,
+)
 from tiny_diffusion.utils import tracking
 from tiny_diffusion.utils.seed import set_seed
+
+# WHY THIS IS A MODULE-LEVEL CONSTANT, READ FROM AN ENV VAR WITH A
+# FALLBACK, RATHER THAN HARDCODED: the dataset handle is
+# "<kaggle-username>/<dataset-slug>" — specific to whoever's account is
+# running this. Hardcoding one person's handle would silently break for
+# anyone else (or any future you, if you rename the dataset). The
+# fallback value below is a reasonable default matching this project's
+# actual setup, but can be overridden via environment variable without
+# editing code — same pattern as MLFLOW_TRACKING_URI elsewhere in this
+# project.
+KAGGLE_CHECKPOINT_DATASET_HANDLE = os.environ.get(
+    "KAGGLE_CHECKPOINT_DATASET_HANDLE",
+    "harsimranjit2004/tiny-diffusion-checkpoints",
+)
 
 
 def build_model_config(cfg: DictConfig) -> ModelConfig:
@@ -165,6 +205,40 @@ def generate_sample_grid(
 
     # Convert back to viewable [0,1] range for the saved image
     return denormalize(x, normalize_mean, normalize_std)
+
+
+def is_running_on_sagemaker() -> bool:
+    """
+    Detect SageMaker Training Job environment.
+
+    WHY SM_TRAINING_ENV SPECIFICALLY: SageMaker's training container sets
+    this environment variable automatically in every job — it is never
+    present on Kaggle, Colab, or a local machine. This is the standard,
+    documented way to detect "am I running as a SageMaker training job"
+    without any extra configuration on our part.
+    """
+    return "SM_TRAINING_ENV" in os.environ
+
+
+def get_checkpoint_dir() -> Path:
+    """
+    Return the correct checkpoint directory for whichever environment
+    we're actually running in.
+
+    SageMaker: /opt/ml/checkpoints — this exact path is automatically
+    synced to S3 by SageMaker itself (configured via the
+    CheckpointConfig.LocalPath parameter when launching the job — see
+    the SageMaker launch script). We do not call any DVC functions on
+    this path; SageMaker's own sync mechanism replaces what DVC was
+    doing for us on Kaggle/Colab.
+
+    Kaggle/Colab/local: outputs/checkpoints — unchanged from the
+    original design, still uses DVC add/push/pull (see checkpoint.py),
+    since these platforms have no equivalent built-in sync mechanism.
+    """
+    if is_running_on_sagemaker():
+        return Path("/opt/ml/checkpoints")
+    return Path("outputs/checkpoints")
 
 
 def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
@@ -297,18 +371,37 @@ def train(cfg: DictConfig) -> None:
     # from step 50,000 with no steps 0-49,999 visible) with no indication
     # why, since this would actually be a SEPARATE MLflow run ID continuing
     # the SAME underlying model weights.
-    checkpoint_dir = Path("outputs/checkpoints")
+    checkpoint_dir = get_checkpoint_dir()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Pull any checkpoint that survived from a PREVIOUS session ────────
-    # WHY THIS MUST HAPPEN BEFORE find_latest_checkpoint(): Kaggle/Colab
-    # wipe local disk between sessions — a checkpoint saved and DVC-pushed
-    # on a prior day exists only on the DVC remote (Google Drive) at the
-    # start of a fresh session, not on local disk. Without this pull,
-    # find_latest_checkpoint() would correctly report "nothing found" even
-    # though a checkpoint genuinely exists — just not locally yet. This
-    # gap was caught before any multi-day GPU time was spent relying on it.
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    dvc_pull_latest_checkpoint(checkpoint_dir)
+    # WHY THIS IS SKIPPED ENTIRELY ON SAGEMAKER: SageMaker has ALREADY
+    # downloaded any prior checkpoint from S3 into checkpoint_dir
+    # automatically, before this script even started running — that's
+    # the whole point of pointing CheckpointConfig.LocalPath at this
+    # directory when the job was launched. Calling dvc_pull here would
+    # be redundant at best; at worst it could error since this path may
+    # not even be a DVC-tracked location on SageMaker's filesystem.
+    #
+    # WHY KAGGLE GETS ITS OWN BRANCH (Kaggle Datasets, not DVC): Google
+    # Drive's OAuth consent flow proved fundamentally incompatible with
+    # Kaggle's non-interactive "Save & Run All" batch execution (the
+    # push call hung for a full 300s timeout waiting on a browser
+    # redirect that could never complete — confirmed via direct testing).
+    # Kaggle Datasets use simple API-token auth instead, with no OAuth
+    # involved, so we try that restore path first when on Kaggle.
+    #
+    # WHY EVERYTHING ELSE (Colab, local) STILL USES DVC: those platforms
+    # don't have Kaggle's Dataset feature, and a human IS present to
+    # complete OAuth interactively there if needed (Colab sessions are
+    # typically run interactively, unlike Kaggle's batch mode) — so DVC
+    # remains a reasonable fallback for them.
+    if is_running_on_sagemaker():
+        pass  # SageMaker's own S3 sync already handled this before we started
+    elif is_running_on_kaggle():
+        restore_checkpoints_from_kaggle_dataset(checkpoint_dir)
+    else:
+        dvc_pull_latest_checkpoint(checkpoint_dir)
 
     resume_checkpoint = find_latest_checkpoint(checkpoint_dir)
 
@@ -379,9 +472,15 @@ def train(cfg: DictConfig) -> None:
         # docstring distinguishing this from
         # the model-weights EMA
 
-        print(
-            f"[train] starting training: {num_epochs} epochs, " f"{len(train_loader)} steps/epoch"
-        )
+        # WHY DEFINED HERE, ONCE: reused both for the startup print below
+        # AND for the Kaggle Dataset upload-frequency check further down
+        # (limiting uploads to roughly once per epoch, not every single
+        # checkpoint_every_n_steps interval — see that branch's comment
+        # for why whole-directory Kaggle Dataset uploads are expensive
+        # enough to warrant throttling).
+        steps_per_epoch = len(train_loader)
+
+        print(f"[train] starting training: {num_epochs} epochs, " f"{steps_per_epoch} steps/epoch")
 
         for epoch in range(start_epoch, num_epochs):
             # NOTE: resume granularity is per-EPOCH, not per-batch. If a
@@ -478,9 +577,9 @@ def train(cfg: DictConfig) -> None:
                     iter_time = time.time() - step_start_time
                     tracking.log_system_metrics(step=global_step, iteration_time_sec=iter_time)
 
-                # ── Periodic checkpointing (resumability, via DVC add+push) ──
+                # ── Periodic checkpointing ──────────────────────────────────
                 if global_step > 0 and global_step % checkpoint_every == 0:
-                    ckpt_path = Path(f"outputs/checkpoints/step_{global_step:07d}.pt")
+                    ckpt_path = checkpoint_dir / f"step_{global_step:07d}.pt"
                     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
                     torch.save(
                         {
@@ -494,48 +593,73 @@ def train(cfg: DictConfig) -> None:
                     )
                     print(f"[train] saved checkpoint: {ckpt_path}")
 
-                    # ── DVC add + push: makes this checkpoint survive a ──
-                    # session ending — WITHOUT this, the checkpoint exists
-                    # ONLY on this session's local (ephemeral) disk and is
-                    # lost the moment the Kaggle/Colab session ends. This
-                    # IS a real, visible stall on the training loop (DVC
-                    # has to hash + upload the file over the network) —
-                    # an honest, accepted cost given that cross-session
-                    # persistence is the entire point of checkpointing in
-                    # the first place for an 18hr-across-multiple-sessions
-                    # training plan. add/push failures warn loudly (see
-                    # checkpoint.py) but never raise — a flaky network
-                    # blip should not crash hours of training progress
-                    # that's still safely on local disk even if the DVC
-                    # push itself failed this one time.
-                    add_ok = dvc_add_checkpoint(ckpt_path)
-                    if add_ok:
-                        push_ok = dvc_push_checkpoint(ckpt_path)
-                        if push_ok:
-                            confirmed_pushed_checkpoints.add(str(ckpt_path))
+                    if is_running_on_sagemaker():
+                        # ── SageMaker: persistence is automatic ──────────
+                        # SageMaker watches checkpoint_dir
+                        # (/opt/ml/checkpoints) and syncs its contents to
+                        # S3 in the background continuously — no add/push
+                        # calls needed, no OAuth, no DVC. This is the
+                        # entire reason we moved the multi-session
+                        # baseline run to SageMaker after Google Drive's
+                        # OAuth flow proved fundamentally incompatible
+                        # with Kaggle's non-interactive batch execution.
+                        #
+                        # We still need OUR OWN disk-space cleanup, though
+                        # — SageMaker's sync to S3 does not automatically
+                        # delete old local files, and the exact same
+                        # disk-exhaustion bug we hit on Kaggle (checkpoints
+                        # accumulating uncapped, ~0.88GB each) could recur
+                        # here if left unbounded. Since SageMaker's own
+                        # sync already guarantees durability, we treat
+                        # every locally-saved checkpoint as "confirmed
+                        # pushed" for cleanup purposes — there is no
+                        # separate push step to fail here, unlike the DVC
+                        # path's genuine add-vs-push distinction.
+                        confirmed_pushed_checkpoints.add(str(ckpt_path))
+                    elif is_running_on_kaggle():
+                        # ── Kaggle: upload to Kaggle Datasets ────────────
+                        # WHY NOT EVERY CHECKPOINT INTERVAL: unlike DVC's
+                        # per-file add+push, Kaggle Dataset versioning
+                        # uploads the ENTIRE directory as one new version
+                        # each call (see kaggle_checkpoint.py's docstring)
+                        # — calling this every checkpoint_every_n_steps
+                        # would re-upload already-uploaded checkpoints
+                        # repeatedly, wasting bandwidth. We upload only
+                        # once per epoch instead, which still bounds data
+                        # loss to at most one epoch's worth of progress
+                        # if a session ends unexpectedly — the same
+                        # acceptable tradeoff documented in the per-epoch
+                        # resume granularity note earlier in this function.
+                        if global_step % steps_per_epoch < checkpoint_every:
+                            upload_ok = upload_checkpoints_to_kaggle_dataset(
+                                checkpoint_dir,
+                                dataset_handle=KAGGLE_CHECKPOINT_DATASET_HANDLE,
+                            )
+                            if upload_ok:
+                                confirmed_pushed_checkpoints.add(str(ckpt_path))
+                    else:
+                        # ── Colab/local: DVC add + push ──────────────────
+                        # See checkpoint.py's docstrings for the full
+                        # reasoning — this path stalls training briefly
+                        # for the network upload, an accepted cost given
+                        # cross-session persistence is the entire point.
+                        add_ok = dvc_add_checkpoint(ckpt_path)
+                        if add_ok:
+                            push_ok = dvc_push_checkpoint(ckpt_path)
+                            if push_ok:
+                                confirmed_pushed_checkpoints.add(str(ckpt_path))
 
-                    # ── Disk space cleanup — THE BUG THIS FIXES ──────────
-                    # WHY THIS IS NOT OPTIONAL: checkpoint.py's
-                    # cleanup_old_checkpoints() was written back when we
-                    # first built checkpoint.py, but never actually wired
-                    # into the live training loop until now. Each
-                    # checkpoint here is ~0.88GB (model 0.22GB + AdamW
-                    # optimizer state 0.44GB, since Adam stores momentum
-                    # AND variance per parameter + EMA shadow 0.22GB) —
-                    # NOT the ~220MB originally estimated (that only
-                    # counted model weights). Without this cleanup call,
-                    # checkpoints accumulate uncapped on Kaggle's limited
-                    # local disk. This caused a REAL crash during Phase 3's
-                    # first full baseline run: after ~5 accumulated
-                    # checkpoints (~4.4GB), torch.save() failed mid-write
-                    # with a corrupted-file error consistent with the disk
-                    # running out of space at that exact moment, 14 epochs
-                    # into what would have been an 18-hour run. We only
-                    # ever delete a checkpoint that's in
-                    # confirmed_pushed_checkpoints — i.e. dvc push
-                    # ACTUALLY succeeded for it, not merely that dvc add
-                    # succeeded (a real distinction — see checkpoint.py's
-                    # docstring for the gap this closes).
+                    # ── Disk space cleanup (both backends) ───────────────
+                    # WHY THIS IS NOT OPTIONAL: each checkpoint is ~0.88GB
+                    # (model 0.22GB + AdamW optimizer state 0.44GB, since
+                    # Adam stores momentum AND variance per parameter +
+                    # EMA shadow 0.22GB). Without bounding local disk
+                    # usage, checkpoints accumulate uncapped — this
+                    # caused a REAL crash during this project's first
+                    # full baseline run on Kaggle (disk exhausted after
+                    # ~5 accumulated checkpoints, 14 epochs into an
+                    # 18-hour run). We only ever delete a checkpoint
+                    # that's in confirmed_pushed_checkpoints.
                     cleanup_old_checkpoints(
                         checkpoint_dir,
                         keep_last_n=3,
