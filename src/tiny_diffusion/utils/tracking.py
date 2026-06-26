@@ -339,10 +339,32 @@ def detect_instability(
         # instability in the first 10 logged steps of a run.
         return False
 
+    import math
     import statistics
 
-    mean = statistics.mean(grad_norm_history)
-    stdev = statistics.stdev(grad_norm_history) if len(grad_norm_history) > 1 else 0
+    # WHY WE FILTER NON-FINITE VALUES BEFORE CALLING statistics.stdev():
+    # If a gradient overflows to Inf (possible with AMP when the loss
+    # scaler hasn't caught the overflow yet), compute_grad_norm() returns
+    # Inf, which gets appended to grad_norm_history. statistics.stdev()
+    # then calls _ss() → variance() → .as_integer_ratio() on the Inf
+    # value, which raises OverflowError and crashes the entire training
+    # run — exactly the failure mode we hit at step ~10,377 after 2.5hrs
+    # of otherwise successful training. Filtering to finite values only
+    # degrades the detection signal slightly (one bad value excluded from
+    # a 50-value window) but keeps training alive through transient spikes
+    # that the AMP scaler would have handled anyway.
+    finite_history = [v for v in grad_norm_history if math.isfinite(v)]
+    if len(finite_history) < 10:
+        return False
+
+    # Also skip detection if the current grad_norm itself is non-finite —
+    # it's already a known bad step, no need to flag it as a "spike" on
+    # top of whatever the AMP scaler is already doing about it.
+    if not math.isfinite(grad_norm):
+        return False
+
+    mean = statistics.mean(finite_history)
+    stdev = statistics.stdev(finite_history) if len(finite_history) > 1 else 0
 
     if stdev == 0:
         return False

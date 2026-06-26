@@ -99,7 +99,18 @@ def compute_grad_norm(model: torch.nn.Module) -> float:
     for p in model.parameters():
         if p.grad is not None:
             total_norm_sq += p.grad.data.norm(2).item() ** 2
-    return float(total_norm_sq**0.5)
+    result = float(total_norm_sq**0.5)
+    # WHY WE CAP NON-FINITE RESULTS: with AMP, a loss-scale overflow can
+    # produce Inf gradients for one step before the scaler detects and
+    # rolls back the scale factor. Returning Inf here would poison
+    # grad_norm_history and crash detect_instability() via OverflowError
+    # in statistics.stdev() — the exact failure we hit at step ~10,377.
+    # Returning 0.0 for non-finite norms is safe: the AMP scaler skips
+    # the optimizer.step() for that iteration anyway, so the 0.0 is never
+    # used for anything meaningful beyond logging.
+    import math
+
+    return result if math.isfinite(result) else 0.0
 
 
 @torch.no_grad()
