@@ -204,6 +204,17 @@ if _is_running_on_vertex_ai():
     _src_path = _ensure_project_cloned()
     if str(_src_path) not in sys.path:
         sys.path.insert(0, str(_src_path))
+    # WHY THIS IS THE REAL BUG FIX: @hydra.main(config_path="../configs")
+    # resolves that path relative to this script's __file__ on the Vertex AI
+    # container (e.g. /root/trainer/train.py), so "../configs" points to
+    # /root/configs/ which doesn't exist — the cloned repo's configs at
+    # /tmp/tiny-diffusion-cifar10/configs/ are never found, and Hydra fails
+    # before training can start. Injecting --config-path here overrides the
+    # decorator's baked-in relative path with the correct absolute path to
+    # the freshly-cloned repo's configs directory.
+    _config_path = str(_src_path.parent / "configs")
+    if "--config-path" not in sys.argv and "-cp" not in sys.argv:
+        sys.argv[1:1] = ["--config-path", _config_path]
 
 # WHY noqa: E402 ON EVERY IMPORT BELOW THIS POINT: these imports must
 # come AFTER the conditional sys.path modification above by design —

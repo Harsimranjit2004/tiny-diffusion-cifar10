@@ -170,6 +170,7 @@ def main() -> None:
             "einops==0.8.0",
             "mlflow==2.14.1",
             "datasets==2.20.0",
+            "Pillow",  # datasets returns PIL images; base container may vary
             "python-dotenv==1.0.1",
             "hydra-core==1.3.2",
             "omegaconf==2.3.0",

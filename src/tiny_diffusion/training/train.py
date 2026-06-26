@@ -21,25 +21,13 @@ step. Splitting these into many tiny functions called once each would
 add indirection without adding clarity — this is a case where a longer,
 well-commented function is more readable than scattered abstraction.
 
-CHECKPOINT BACKEND — DVC (Kaggle/Colab/local) vs SAGEMAKER (native S3 sync):
-  After repeatedly fighting Google Drive's OAuth flow being fundamentally
-  incompatible with Kaggle's non-interactive "Save & Run All" batch mode
-  (a real, unresolved blocker — see the long debugging history that led
-  here), we added SageMaker Training Jobs as a parallel execution path.
-  SageMaker has a BUILT-IN checkpoint mechanism: any files written to
-  /opt/ml/checkpoints are automatically synced to S3 by SageMaker itself,
-  with zero OAuth, zero DVC, zero manual remote configuration. On job
-  restart (e.g. after a spot interruption), SageMaker automatically
-  downloads the S3 checkpoint contents back into that same local path
-  BEFORE your script even starts running.
+CHECKPOINT BACKEND — DVC (Colab/local) vs Vertex AI (GCS FUSE):
+  Vertex AI has a BUILT-IN checkpoint mechanism: torch.save() to the
+  /gcs/ FUSE-mounted path writes directly into Cloud Storage — durable
+  the instant the call returns, no DVC, no OAuth needed.
 
-  We detect which environment we're in via the SM_TRAINING_ENV
-  environment variable (SageMaker sets this automatically in every
-  training job container; it is simply absent on Kaggle/Colab/local).
-  This lets the SAME train.py work correctly on both platforms without
-  maintaining two divergent training scripts — the only difference is
-  which checkpoint directory we write to and whether we call DVC's
-  add/push/pull functions at all.
+  On Colab/local, DVC add/push/pull functions are still used for
+  cross-session persistence via Google Drive.
 """
 
 import os
@@ -63,27 +51,8 @@ from tiny_diffusion.training.checkpoint import (
     dvc_pull_latest_checkpoint,
     dvc_push_checkpoint,
 )
-from tiny_diffusion.training.kaggle_checkpoint import (
-    is_running_on_kaggle,
-    restore_checkpoints_from_kaggle_dataset,
-    upload_checkpoints_to_kaggle_dataset,
-)
 from tiny_diffusion.utils import tracking
 from tiny_diffusion.utils.seed import set_seed
-
-# WHY THIS IS A MODULE-LEVEL CONSTANT, READ FROM AN ENV VAR WITH A
-# FALLBACK, RATHER THAN HARDCODED: the dataset handle is
-# "<kaggle-username>/<dataset-slug>" — specific to whoever's account is
-# running this. Hardcoding one person's handle would silently break for
-# anyone else (or any future you, if you rename the dataset). The
-# fallback value below is a reasonable default matching this project's
-# actual setup, but can be overridden via environment variable without
-# editing code — same pattern as MLFLOW_TRACKING_URI elsewhere in this
-# project.
-KAGGLE_CHECKPOINT_DATASET_HANDLE = os.environ.get(
-    "KAGGLE_CHECKPOINT_DATASET_HANDLE",
-    "harsimranjit2004/tiny-diffusion-checkpoints",
-)
 
 
 def build_model_config(cfg: DictConfig) -> ModelConfig:
@@ -207,19 +176,6 @@ def generate_sample_grid(
     return denormalize(x, normalize_mean, normalize_std)
 
 
-def is_running_on_sagemaker() -> bool:
-    """
-    Detect SageMaker Training Job environment.
-
-    WHY SM_TRAINING_ENV SPECIFICALLY: SageMaker's training container sets
-    this environment variable automatically in every job — it is never
-    present on Kaggle, Colab, Vertex AI, or a local machine. This is the
-    standard, documented way to detect "am I running as a SageMaker
-    training job" without any extra configuration on our part.
-    """
-    return "SM_TRAINING_ENV" in os.environ
-
-
 def is_running_on_vertex_ai() -> bool:
     """
     Detect Vertex AI Custom Training Job environment.
@@ -239,13 +195,6 @@ def get_checkpoint_dir() -> Path:
     Return the correct checkpoint directory for whichever environment
     we're actually running in.
 
-    SageMaker: /opt/ml/checkpoints — this exact path is automatically
-    synced to S3 by SageMaker itself (configured via the
-    CheckpointConfig.LocalPath parameter when launching the job — see
-    the SageMaker launch script). We do not call any DVC functions on
-    this path; SageMaker's own sync mechanism replaces what DVC was
-    doing for us on Kaggle/Colab.
-
     Vertex AI: reads the AIP_CHECKPOINT_DIR environment variable, which
     Vertex AI sets automatically to a gs:// Cloud Storage URI for every
     training job. We convert that gs:// URI to its FUSE-mounted local
@@ -258,14 +207,9 @@ def get_checkpoint_dir() -> Path:
     OAuth flow or DVC remote configuration, the two things that blocked
     us on Kaggle and complicated every other path we tried.
 
-    Kaggle/Colab/local: outputs/checkpoints — unchanged from the
-    original design, still uses DVC add/push/pull (see checkpoint.py)
-    or Kaggle Datasets (see kaggle_checkpoint.py), since these platforms
-    have no equivalent built-in sync mechanism.
+    Colab/local: outputs/checkpoints — uses DVC add/push/pull (see
+    checkpoint.py) for cross-session persistence via Google Drive.
     """
-    if is_running_on_sagemaker():
-        return Path("/opt/ml/checkpoints")
-
     if is_running_on_vertex_ai():
         aip_checkpoint_dir = os.environ.get("AIP_CHECKPOINT_DIR", "")
         if aip_checkpoint_dir.startswith("gs://"):
@@ -422,34 +366,11 @@ def train(cfg: DictConfig) -> None:
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Pull any checkpoint that survived from a PREVIOUS session ────────
-    # WHY THIS IS SKIPPED ENTIRELY ON SAGEMAKER AND VERTEX AI: both
-    # platforms have ALREADY made any prior checkpoint available in
-    # checkpoint_dir before this script even started running — SageMaker
-    # via its S3 sync into /opt/ml/checkpoints, Vertex AI via the FUSE
-    # mount at /gcs/... which IS the Cloud Storage location directly (no
-    # separate "download" step exists or is needed — reading from /gcs/
-    # reads from Cloud Storage live). Calling dvc_pull here would be
-    # redundant at best; at worst it could error since neither path is a
-    # DVC-tracked location.
-    #
-    # WHY KAGGLE GETS ITS OWN BRANCH (Kaggle Datasets, not DVC): Google
-    # Drive's OAuth consent flow proved fundamentally incompatible with
-    # Kaggle's non-interactive "Save & Run All" batch execution (the
-    # push call hung for a full 300s timeout waiting on a browser
-    # redirect that could never complete — confirmed via direct testing).
-    # Kaggle Datasets use simple API-token auth instead, with no OAuth
-    # involved, so we try that restore path first when on Kaggle.
-    #
-    # WHY EVERYTHING ELSE (Colab, local) STILL USES DVC: those platforms
-    # don't have Kaggle's Dataset feature, and a human IS present to
-    # complete OAuth interactively there if needed (Colab sessions are
-    # typically run interactively, unlike Kaggle's batch mode) — so DVC
-    # remains a reasonable fallback for them.
-    if is_running_on_sagemaker() or is_running_on_vertex_ai():
-        pass  # both platforms' native sync already handled this before we started
-    elif is_running_on_kaggle():
-        restore_checkpoints_from_kaggle_dataset(checkpoint_dir)
-    else:
+    # WHY THIS IS SKIPPED ON VERTEX AI: the /gcs/ FUSE mount IS Cloud
+    # Storage directly — reading from checkpoint_dir already sees prior
+    # checkpoints live, no separate download step needed.
+    # Colab/local still use DVC pull to fetch from Google Drive.
+    if not is_running_on_vertex_ai():
         dvc_pull_latest_checkpoint(checkpoint_dir)
 
     resume_checkpoint = find_latest_checkpoint(checkpoint_dir)
@@ -642,79 +563,16 @@ def train(cfg: DictConfig) -> None:
                     )
                     print(f"[train] saved checkpoint: {ckpt_path}")
 
-                    if is_running_on_sagemaker():
-                        # ── SageMaker: persistence is automatic ──────────
-                        # SageMaker watches checkpoint_dir
-                        # (/opt/ml/checkpoints) and syncs its contents to
-                        # S3 in the background continuously — no add/push
-                        # calls needed, no OAuth, no DVC. This is the
-                        # entire reason we moved the multi-session
-                        # baseline run to SageMaker after Google Drive's
-                        # OAuth flow proved fundamentally incompatible
-                        # with Kaggle's non-interactive batch execution.
-                        #
-                        # We still need OUR OWN disk-space cleanup, though
-                        # — SageMaker's sync to S3 does not automatically
-                        # delete old local files, and the exact same
-                        # disk-exhaustion bug we hit on Kaggle (checkpoints
-                        # accumulating uncapped, ~0.88GB each) could recur
-                        # here if left unbounded. Since SageMaker's own
-                        # sync already guarantees durability, we treat
-                        # every locally-saved checkpoint as "confirmed
-                        # pushed" for cleanup purposes — there is no
-                        # separate push step to fail here, unlike the DVC
-                        # path's genuine add-vs-push distinction.
+                    if is_running_on_vertex_ai():
+                        # ── Vertex AI: persistence is automatic ──────────
+                        # torch.save() to ckpt_path wrote directly into
+                        # the /gcs/ FUSE mount — the bytes are in Cloud
+                        # Storage the instant save() returns, durably,
+                        # with no separate sync/push step. Treat every
+                        # save as confirmed for cleanup purposes.
                         confirmed_pushed_checkpoints.add(str(ckpt_path))
-                    elif is_running_on_vertex_ai():
-                        # ── Vertex AI: persistence is automatic too ──────
-                        # torch.save() to ckpt_path ALREADY wrote directly
-                        # into the /gcs/ FUSE mount — the bytes are in
-                        # Cloud Storage the instant the save() call
-                        # returns, durably, with no separate sync/push
-                        # step at all (unlike SageMaker, which writes to
-                        # genuinely local disk first and syncs to S3
-                        # asynchronously in the background). No add/push
-                        # calls needed here, no OAuth, no DVC.
-                        #
-                        # WHY CLEANUP STILL RUNS HERE TOO, DESPITE /gcs/
-                        # NOT BEING "REAL" LOCAL DISK: Cloud Storage FUSE
-                        # has its own local cache and the underlying VM
-                        # still has a finite boot-disk size — leaving
-                        # checkpoints to accumulate without bound is
-                        # still a real risk we'd rather not test
-                        # empirically a second time, given we already
-                        # learned this lesson the hard way once. Treating
-                        # every save as "confirmed pushed" is correct
-                        # here for the same reason as SageMaker: no
-                        # separate push step exists to fail.
-                        confirmed_pushed_checkpoints.add(str(ckpt_path))
-                    elif is_running_on_kaggle():
-                        # ── Kaggle: upload to Kaggle Datasets ────────────
-                        # WHY NOT EVERY CHECKPOINT INTERVAL: unlike DVC's
-                        # per-file add+push, Kaggle Dataset versioning
-                        # uploads the ENTIRE directory as one new version
-                        # each call (see kaggle_checkpoint.py's docstring)
-                        # — calling this every checkpoint_every_n_steps
-                        # would re-upload already-uploaded checkpoints
-                        # repeatedly, wasting bandwidth. We upload only
-                        # once per epoch instead, which still bounds data
-                        # loss to at most one epoch's worth of progress
-                        # if a session ends unexpectedly — the same
-                        # acceptable tradeoff documented in the per-epoch
-                        # resume granularity note earlier in this function.
-                        if global_step % steps_per_epoch < checkpoint_every:
-                            upload_ok = upload_checkpoints_to_kaggle_dataset(
-                                checkpoint_dir,
-                                dataset_handle=KAGGLE_CHECKPOINT_DATASET_HANDLE,
-                            )
-                            if upload_ok:
-                                confirmed_pushed_checkpoints.add(str(ckpt_path))
                     else:
                         # ── Colab/local: DVC add + push ──────────────────
-                        # See checkpoint.py's docstrings for the full
-                        # reasoning — this path stalls training briefly
-                        # for the network upload, an accepted cost given
-                        # cross-session persistence is the entire point.
                         add_ok = dvc_add_checkpoint(ckpt_path)
                         if add_ok:
                             push_ok = dvc_push_checkpoint(ckpt_path)
