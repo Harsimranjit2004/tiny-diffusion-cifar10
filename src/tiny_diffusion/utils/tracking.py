@@ -173,10 +173,32 @@ def init_tracking(experiment_name: str = "tiny-diffusion-cifar10") -> None:
             "Phase 2 Step 2 instructions for the exact DagsHub URL format."
         )
 
+    # WHY WE EMBED CREDENTIALS INTO THE URI INSTEAD OF RELYING ON THE
+    # SEPARATE MLFLOW_TRACKING_USERNAME / PASSWORD ENV VARS:
+    # In containerised environments (Vertex AI custom training jobs), mlflow
+    # 2.x does not reliably pick up those two env vars when making the initial
+    # REST call to set_experiment() — the server returns a 401 even when both
+    # vars are present and correct. Embedding credentials directly in the URI
+    # as https://user:pass@host/path is the guaranteed HTTP Basic Auth path
+    # that works across every mlflow version and every container runtime,
+    # because the credentials travel with every request rather than being
+    # looked up separately. This is the same pattern we use for the git clone
+    # URL (DAGSHUB_TOKEN embedded in the HTTPS URL) — non-interactive
+    # containers need credentials baked in, not fetched via a side channel.
+    username = os.environ.get("MLFLOW_TRACKING_USERNAME", "")
+    password = os.environ.get("MLFLOW_TRACKING_PASSWORD", "")
+    if username and password and "://" in tracking_uri and "@" not in tracking_uri:
+        scheme, rest = tracking_uri.split("://", 1)
+        tracking_uri = f"{scheme}://{username}:{password}@{rest}"
+
     mlflow.set_tracking_uri(tracking_uri)
     mlflow.set_experiment(experiment_name)
 
-    print(f"[tracking] MLflow tracking URI: {tracking_uri}")
+    # Redact credentials from the printed URI so the token never appears in logs.
+    logged_uri = tracking_uri
+    if password and password in logged_uri:
+        logged_uri = logged_uri.replace(password, "***TOKEN***")
+    print(f"[tracking] MLflow tracking URI: {logged_uri}")
     print(f"[tracking] Experiment: {experiment_name}")
 
 
