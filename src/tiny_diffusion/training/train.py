@@ -504,6 +504,25 @@ def train(cfg: DictConfig) -> None:
                     # everything else in this function is infrastructure
                     # around this one mathematical statement.
 
+                # ── NaN/Inf loss guard ───────────────────────────────────────
+                # WHY THIS CHECK EXISTS: if loss becomes NaN or Inf (e.g. from
+                # an AMP overflow that the scaler hasn't caught yet, or a bad
+                # batch), continuing to call .backward() propagates NaN into
+                # every parameter's gradient, poisoning the model weights
+                # permanently. Once weights are NaN, no amount of gradient
+                # clipping or scaler adjustment recovers them — training runs
+                # dead for the remaining epochs, which is exactly what happened
+                # at step ~23,923. Skipping the step on a bad loss value costs
+                # one batch of progress; not skipping costs the entire run.
+                if not torch.isfinite(loss):
+                    print(
+                        f"[WARNING] step {global_step}: loss={loss.item():.4f} "
+                        f"is non-finite — skipping backward/step for this batch."
+                    )
+                    optimizer.zero_grad(set_to_none=True)
+                    global_step += 1
+                    continue
+
                 # ── Backward pass ────────────────────────────────────────────
                 scaler.scale(loss).backward()
 

@@ -21,7 +21,10 @@ ema_decay: 0.9999
 # Mixed precision — fp16 autocast during training (NOT the same as the
 # fp16 QUANTIZATION variant in Phase 5 — this is training-time precision,
 # that's post-training inference precision. Easy naming confusion to avoid.)
-mixed_precision: true
+# WHY DISABLED: AMP loss-scale overflow caused grad_norm to spike to 26.96
+# at step ~23,923, collapsing the model to NaN for the remaining 140 epochs.
+# fp32 training is ~20% slower on T4 but eliminates the overflow risk entirely.
+mixed_precision: false
 
 # Gradient clipping — caps grad_norm to prevent the instability spikes
 # that Phase 2 Step 2's detect_instability() function watches for.

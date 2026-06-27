@@ -59,7 +59,7 @@ from google.cloud import aiplatform, storage
 # epoch first. This MUST be defined before any other constant that
 # reads it. Set to False once the validation run succeeds and you're
 # ready for the real baseline training.
-VALIDATION_RUN = True
+VALIDATION_RUN = False
 
 PROJECT_ID = "tiny-diffusion-training"
 REGION = "us-central1"
