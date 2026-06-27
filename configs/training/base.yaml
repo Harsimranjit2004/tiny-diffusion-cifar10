@@ -6,7 +6,12 @@
 # architecture, or vice versa. Hydra's config-group system is built
 # exactly for this kind of independent-axis composition.
 
-lr: 2e-4
+# WHY LOWERED FROM 2e-4: two separate collapses (NaN at step ~23,923, then
+# loss flatlining to ~1.0 at step ~12,700 on the next attempt) both point to
+# the optimizer taking steps too large for this model/batch size combo.
+# Halving LR trades a small amount of convergence speed for meaningfully
+# more headroom before hitting the same instability a third time.
+lr: 1e-4
 batch_size: 128
 num_epochs: 200
 
@@ -28,7 +33,11 @@ mixed_precision: false
 
 # Gradient clipping — caps grad_norm to prevent the instability spikes
 # that Phase 2 Step 2's detect_instability() function watches for.
-grad_clip_norm: 1.0
+# WHY TIGHTENED FROM 1.0: grad_norm reached 26.96 before the first collapse —
+# clipping to 1.0 wasn't aggressive enough to prevent the underlying step
+# from still being destabilising. 0.5 trades a little convergence speed for
+# a tighter leash on how large any single update can be.
+grad_clip_norm: 0.5
 
 # Cosine LR decay — decays LR from `lr` down to lr*0.1 over the full run.
 # Set to false to keep a flat learning rate (original behaviour).

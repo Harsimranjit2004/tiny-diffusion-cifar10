@@ -430,6 +430,20 @@ def train(cfg: DictConfig) -> None:
             global_step, start_epoch = load_checkpoint_for_resume(
                 resume_checkpoint, model, optimizer, ema, device
             )
+            # WHY WE FORCE-OVERRIDE LR AFTER RESUME: optimizer.load_state_dict()
+            # restores param_groups verbatim, INCLUDING the lr that was active
+            # when the checkpoint was saved. If the config's lr was changed
+            # since then (e.g. lowered from 2e-4 to 1e-4 after a collapse),
+            # the restored optimizer silently reverts to the OLD lr — the
+            # config change would have no effect at all without this override.
+            config_lr = cfg.experiment.training.lr
+            for group in optimizer.param_groups:
+                if group["lr"] != config_lr:
+                    print(
+                        f"[train] overriding resumed optimizer LR "
+                        f"{group['lr']:.2e} → {config_lr:.2e} (from current config)"
+                    )
+                    group["lr"] = config_lr
         else:
             global_step = 0
             start_epoch = 0
@@ -460,6 +474,19 @@ def train(cfg: DictConfig) -> None:
         # criterion than a lucky raw-loss reading.
         best_ema_loss: float = float("inf")
         best_ckpt_path = checkpoint_dir / "best.pt"
+        consecutive_bad_steps: int = 0
+
+        # WHY WE LOAD best_ema_loss FROM best.pt ON STARTUP: without this,
+        # every resume starts the explosion guard blind (best_ema_loss=inf
+        # means is_exploded can never trigger) until a fresh epoch
+        # completes — leaving the first ~390 steps after a resume
+        # unprotected, which is exactly the window where the second
+        # collapse occurred. Loading the persisted value means protection
+        # is active from step 1 of a resumed run.
+        if best_ckpt_path.exists():
+            _best_ckpt = torch.load(best_ckpt_path, map_location=device)
+            best_ema_loss = _best_ckpt.get("best_ema_loss", float("inf"))
+            print(f"[train] loaded best_ema_loss={best_ema_loss:.4f} from {best_ckpt_path}")
 
         # ── Early stopping ───────────────────────────────────────────────────
         early_stop_patience = cfg.experiment.training.get("early_stop_patience", 0)
@@ -550,24 +577,70 @@ def train(cfg: DictConfig) -> None:
                     # everything else in this function is infrastructure
                     # around this one mathematical statement.
 
-                # ── NaN/Inf loss guard ───────────────────────────────────────
-                # WHY THIS CHECK EXISTS: if loss becomes NaN or Inf (e.g. from
-                # an AMP overflow that the scaler hasn't caught yet, or a bad
-                # batch), continuing to call .backward() propagates NaN into
-                # every parameter's gradient, poisoning the model weights
-                # permanently. Once weights are NaN, no amount of gradient
-                # clipping or scaler adjustment recovers them — training runs
-                # dead for the remaining epochs, which is exactly what happened
-                # at step ~23,923. Skipping the step on a bad loss value costs
-                # one batch of progress; not skipping costs the entire run.
-                if not torch.isfinite(loss):
+                # ── Loss explosion guard (NaN/Inf AND finite-but-exploded) ──
+                # WHY BOTH CASES MATTER: the first collapse (step ~23,923)
+                # was a NaN — caught by torch.isfinite(). The second collapse
+                # (step ~12,700, this run) was loss flatlining at ~1.0, which
+                # IS finite — MSE(0, unit-variance noise) ≈ 1.0, the exact
+                # signature of the model collapsing to predicting all zeros.
+                # torch.isfinite() alone does not catch this, so we ALSO
+                # check loss against a multiple of best_ema_loss once we
+                # have a real baseline to compare against.
+                loss_value_this_step = loss.item()
+                is_finite = torch.isfinite(loss)
+                is_exploded = (
+                    is_finite
+                    and math.isfinite(best_ema_loss)
+                    and best_ema_loss < float("inf")
+                    and loss_value_this_step > 5.0 * max(best_ema_loss, 1e-4)
+                )
+
+                if not is_finite or is_exploded:
+                    consecutive_bad_steps += 1
                     print(
-                        f"[WARNING] step {global_step}: loss={loss.item():.4f} "
-                        f"is non-finite — skipping backward/step for this batch."
+                        f"[WARNING] step {global_step}: loss={loss_value_this_step:.4f} "
+                        f"is {'non-finite' if not is_finite else 'exploded (>5x best_ema_loss)'} "
+                        f"— skipping backward/step ({consecutive_bad_steps} consecutive)."
                     )
                     optimizer.zero_grad(set_to_none=True)
+
+                    # ── Auto-recovery: sustained collapse → roll back ────────
+                    # WHY THIS EXISTS: a single bad batch recovers fine by
+                    # just skipping it (above). But the actual failure mode
+                    # we've hit twice now is the model PERMANENTLY collapsing
+                    # — every subsequent step is also bad, forever, because
+                    # the weights themselves are now garbage. Skipping
+                    # individual steps in that case just burns GPU-hours
+                    # doing nothing for the rest of the run (exactly what
+                    # happened for 140 dead epochs the first time). If we
+                    # see enough CONSECUTIVE bad steps to rule out "one bad
+                    # batch," the weights are unrecoverable — restore the
+                    # last known-good state from best.pt and halve the LR
+                    # so the optimizer is less likely to walk off the cliff
+                    # the same way twice.
+                    if consecutive_bad_steps >= 30 and best_ckpt_path.exists():
+                        print(
+                            f"[train] {consecutive_bad_steps} consecutive bad steps — "
+                            f"model has likely collapsed permanently. Restoring "
+                            f"from {best_ckpt_path} and halving LR."
+                        )
+                        recovery_ckpt = torch.load(best_ckpt_path, map_location=device)
+                        model.load_state_dict(recovery_ckpt["model_state_dict"])
+                        optimizer.load_state_dict(recovery_ckpt["optimizer_state_dict"])
+                        ema.load_state_dict(recovery_ckpt["ema_state_dict"])
+                        for group in optimizer.param_groups:
+                            group["lr"] *= 0.5
+                        print(
+                            f"[train] recovered from epoch {recovery_ckpt['epoch']} "
+                            f"(ema_loss={recovery_ckpt.get('best_ema_loss', 'n/a')}). "
+                            f"New LR: {optimizer.param_groups[0]['lr']:.2e}"
+                        )
+                        consecutive_bad_steps = 0
+
                     global_step += 1
                     continue
+
+                consecutive_bad_steps = 0
 
                 # ── Backward pass ────────────────────────────────────────────
                 scaler.scale(loss).backward()
