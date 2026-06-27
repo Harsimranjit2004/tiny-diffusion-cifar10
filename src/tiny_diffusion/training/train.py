@@ -713,9 +713,16 @@ def train(cfg: DictConfig) -> None:
                         f"[train] ✓ new best checkpoint at epoch {epoch} "
                         f"(ema_loss={best_ema_loss:.4f}) → {best_ckpt_path}"
                     )
-                    tracking.log_config(
-                        {"best_ema_loss": best_ema_loss, "best_epoch": epoch},
-                        prefix="best.",
+                    # WHY log_metrics NOT log_params: MLflow params are
+                    # write-once — updating best_ema_loss each epoch raises
+                    # "Changing param values is not allowed". Metrics are
+                    # time-series by design and can be overwritten freely.
+                    tracking.log_epoch_metrics(
+                        epoch=epoch,
+                        extra_metrics={
+                            "best_ema_loss": best_ema_loss,
+                            "best_epoch": float(epoch),
+                        },
                     )
                 else:
                     epochs_without_improvement += 1
