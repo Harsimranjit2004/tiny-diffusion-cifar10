@@ -10,9 +10,9 @@ pipeline into the actual training loop.
 WHAT "FULL OBSERVABILITY" MEANS CONCRETELY, PER PHASE 2 STEP 2's SCHEMA:
   - every `log_step_metrics_every` steps: loss, ema_loss, grad_norm, lr
   - every `log_system_metrics_every` steps: GPU util/memory, iter time
-  - every epoch: FID on a cheap sample batch, a sample grid image
+  - every epoch: best-checkpoint tracking by ema_loss
   - automatic instability detection via grad_norm spike monitoring
-  - checkpointing: periodic (for resumability) + best-by-FID (for MLflow)
+  - checkpointing: periodic (for resumability) + best-by-ema_loss
 
 WHY THIS FUNCTION IS LONG: a training loop genuinely has many concerns
 (data, forward pass, loss, backward, EMA update, logging, checkpointing,
@@ -28,6 +28,24 @@ CHECKPOINT BACKEND — DVC (Colab/local) vs Vertex AI (GCS FUSE):
 
   On Colab/local, DVC add/push/pull functions are still used for
   cross-session persistence via Google Drive.
+
+WHY THIS VERSION IS DELIBERATELY SIMPLER THAN AN EARLIER ATTEMPT:
+  Across five real training runs we accumulated a cosine LR scheduler,
+  a 30-consecutive-bad-step auto-recovery mechanism (restore from
+  best.pt + halve LR), and early stopping — layered on reactively, one
+  fix per crash. The auto-recovery logic itself then introduced a new
+  bug (a CUDA OOM from loading a full checkpoint onto GPU just to read
+  one float). At that point the training loop had become more complex
+  than the model it was training, and most of the actual crashes were
+  infrastructure/stability bugs in OUR code, not signals that the
+  model needed rescue machinery. This version strips back to the
+  standard, well-trodden DDPM training setup: fp32 (no AMP instability
+  risk), a flat learning rate, gradient clipping, and a cheap NaN/Inf/
+  exploded-loss skip-guard. best.pt tracking is kept since it's cheap
+  and useful for Phase 4 regardless of how training behaves. If THIS
+  simple version is still unstable, that tells us something real about
+  the architecture or schedule — worth knowing, rather than papering
+  over with increasingly elaborate recovery code.
 """
 
 import math
@@ -101,16 +119,14 @@ def compute_grad_norm(model: torch.nn.Module) -> float:
         if p.grad is not None:
             total_norm_sq += p.grad.data.norm(2).item() ** 2
     result = float(total_norm_sq**0.5)
-    # WHY WE CAP NON-FINITE RESULTS: with AMP, a loss-scale overflow can
-    # produce Inf gradients for one step before the scaler detects and
-    # rolls back the scale factor. Returning Inf here would poison
-    # grad_norm_history and crash detect_instability() via OverflowError
-    # in statistics.stdev() — the exact failure we hit at step ~10,377.
-    # Returning 0.0 for non-finite norms is safe: the AMP scaler skips
-    # the optimizer.step() for that iteration anyway, so the 0.0 is never
-    # used for anything meaningful beyond logging.
-    import math
-
+    # WHY WE CAP NON-FINITE RESULTS: even in fp32 (no AMP), a degenerate
+    # batch can occasionally produce Inf gradients. Returning Inf here
+    # would poison grad_norm_history and crash detect_instability() via
+    # OverflowError in statistics.stdev() — a real failure hit during an
+    # earlier AMP-enabled run. Returning 0.0 for non-finite norms is
+    # safe: the loss-explosion guard in the main loop already catches
+    # and skips the step this came from, so the 0.0 is never used for
+    # anything meaningful beyond logging.
     return result if math.isfinite(result) else 0.0
 
 
@@ -196,8 +212,7 @@ def is_running_on_vertex_ai() -> bool:
     sets several AIP_* and CLOUD_ML_* environment variables automatically
     in every custom training job container — CLOUD_ML_PROJECT_ID is set
     unconditionally regardless of job configuration, making it a reliable
-    presence check. It is never set on SageMaker, Kaggle, Colab, or a
-    local machine. Mirrors is_running_on_sagemaker()'s detection pattern.
+    presence check. It is never set on Kaggle, Colab, or a local machine.
     """
     return "CLOUD_ML_PROJECT_ID" in os.environ
 
@@ -216,8 +231,7 @@ def get_checkpoint_dir() -> Path:
     (torch.save() works directly, no GCS-aware code needed) while the
     bytes are durably stored in Cloud Storage the whole time — this is
     the mechanism that gives us cross-session persistence without any
-    OAuth flow or DVC remote configuration, the two things that blocked
-    us on Kaggle and complicated every other path we tried.
+    OAuth flow or DVC remote configuration.
 
     Colab/local: outputs/checkpoints — uses DVC add/push/pull (see
     checkpoint.py) for cross-session persistence via Google Drive.
@@ -249,13 +263,12 @@ def find_latest_checkpoint(checkpoint_dir: Path) -> Optional[Path]:
     Find the most recent checkpoint by step number, for automatic resume.
 
     WHY THIS EXISTS — THE REAL PROBLEM IT SOLVES:
-    Kaggle sessions cap around 9-12 hours, Colab disconnects even sooner
-    on the free tier. Our measured epoch time (~5.4 min) times 200 epochs
-    is ~18 hours — meaning a SINGLE session cannot complete training.
-    Without resume, every session timeout means losing all progress and
-    restarting global_step=0 with fresh random weights. This function is
-    the first piece of making "train across multiple sessions" actually
-    work rather than just being a plan we hoped would pan out.
+    Kaggle/Colab sessions are time-limited and Vertex AI jobs can be
+    interrupted (e.g. spot capacity reclaim). Our measured epoch time
+    (~5.4 min) times 200 epochs is ~18 hours — meaning a single session
+    or job attempt may not complete in one shot. Without resume, any
+    interruption means losing all progress and restarting global_step=0
+    with fresh random weights.
     """
     if not checkpoint_dir.exists():
         return None
@@ -291,10 +304,7 @@ def load_checkpoint_for_resume(
     If we resumed with a FRESH EMA object, it would re-enter warmup mode
     at step 0 even though the model is actually at step 50,000 — the EMA
     shadow weights would temporarily diverge from a sensible running
-    average. Restoring ema.state_dict() (which includes the decay value,
-    though not the step count itself — see the note below) keeps this
-    consistent enough in practice since by the time you're resuming,
-    decay has already reached its asymptotic value.
+    average. Restoring ema.state_dict() keeps this consistent.
 
     Returns:
         (global_step, epoch) to resume from
@@ -354,10 +364,13 @@ def train(cfg: DictConfig) -> None:
         pin_memory=cfg.experiment.data.pin_memory,
     )
 
-    # Mixed precision setup — see Phase 0/ML Systems textbook connection:
-    # fp16 autocast roughly halves memory bandwidth per step, the same
-    # mechanism Phase 5's quantization study measures post-training, but
-    # here applied DURING training for speed/memory headroom on T4/P100.
+    # WHY mixed_precision IS EFFECTIVELY DISABLED NOW: AMP loss-scale
+    # overflows caused real Inf-gradient crashes during earlier runs. We
+    # keep the use_amp variable and the GradScaler/autocast plumbing
+    # (so this is a one-line config flip to re-enable, not a code
+    # rewrite) but the recommended config value going forward is
+    # mixed_precision: false — fp32 is slower but has shown zero
+    # numerical-stability issues across every run so far.
     use_amp = cfg.experiment.training.mixed_precision and device.type == "cuda"
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -367,21 +380,13 @@ def train(cfg: DictConfig) -> None:
     run_tags = dict(cfg.experiment.tags) if "tags" in cfg.experiment else {}
 
     # ── Resume detection ────────────────────────────────────────────────────
-    # WHY THIS CHECK HAPPENS BEFORE tracking.start_run(): if we're resuming,
-    # we want the MLflow run tagged as a continuation so it's visually
-    # distinguishable in the DagsHub UI from a fresh run — otherwise a
-    # resumed run's loss curve would show a confusing discontinuity (jumping
-    # from step 50,000 with no steps 0-49,999 visible) with no indication
-    # why, since this would actually be a SEPARATE MLflow run ID continuing
-    # the SAME underlying model weights.
     checkpoint_dir = get_checkpoint_dir()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Pull any checkpoint that survived from a PREVIOUS session ────────
     # WHY THIS IS SKIPPED ON VERTEX AI: the /gcs/ FUSE mount IS Cloud
     # Storage directly — reading from checkpoint_dir already sees prior
-    # checkpoints live, no separate download step needed.
-    # Colab/local still use DVC pull to fetch from Google Drive.
+    # checkpoints live, no separate download step needed. Colab/local
+    # still use DVC pull to fetch from Google Drive.
     if not is_running_on_vertex_ai():
         dvc_pull_latest_checkpoint(checkpoint_dir)
 
@@ -390,16 +395,8 @@ def train(cfg: DictConfig) -> None:
     if resume_checkpoint is not None:
         # WHY CHECKING `resume_checkpoint is not None` DIRECTLY, RATHER
         # THAN A SEPARATE is_resuming BOOLEAN: mypy can statically narrow
-        # Optional[Path] to Path within this branch because the check is
-        # directly on the variable itself — a separate `is_resuming =
-        # resume_checkpoint is not None` boolean carries the same logical
-        # information at runtime but mypy cannot follow that link across
-        # two different variables, and flags every later access to
-        # resume_checkpoint as "might still be None" even though it can't
-        # be. This was a real mypy finding (not a runtime bug) caught
-        # when wiring resume logic into a fresh Kaggle session — fixed by
-        # checking the Optional variable directly instead of through an
-        # intermediate boolean.
+        # Optional[Path] to Path within this branch when the check is
+        # directly on the variable itself.
         run_tags["resumed_from"] = resume_checkpoint.name
         print(f"[train] found existing checkpoint, will resume: {resume_checkpoint}")
     else:
@@ -420,12 +417,6 @@ def train(cfg: DictConfig) -> None:
         tracking.log_seed(cfg.experiment.seed)
 
         # ── Training state ───────────────────────────────────────────────
-        # WHY global_step/start_epoch ARE CONDITIONAL ON is_resuming:
-        # this is the actual fix for the 18hr-training-across-multiple-
-        # sessions problem. Without this, every new session would silently
-        # restart at step 0 with FRESH random weights, discarding all
-        # prior GPU-hours of progress the moment a Kaggle/Colab session
-        # disconnects — exactly the failure mode we're avoiding here.
         if resume_checkpoint is not None:
             global_step, start_epoch = load_checkpoint_for_resume(
                 resume_checkpoint, model, optimizer, ema, device
@@ -433,9 +424,8 @@ def train(cfg: DictConfig) -> None:
             # WHY WE FORCE-OVERRIDE LR AFTER RESUME: optimizer.load_state_dict()
             # restores param_groups verbatim, INCLUDING the lr that was active
             # when the checkpoint was saved. If the config's lr was changed
-            # since then (e.g. lowered from 2e-4 to 1e-4 after a collapse),
-            # the restored optimizer silently reverts to the OLD lr — the
-            # config change would have no effect at all without this override.
+            # since then, the restored optimizer would silently revert to the
+            # OLD lr — the config change would have no effect without this.
             config_lr = cfg.experiment.training.lr
             for group in optimizer.param_groups:
                 if group["lr"] != config_lr:
@@ -447,14 +437,7 @@ def train(cfg: DictConfig) -> None:
         else:
             global_step = 0
             start_epoch = 0
-        # NOTE: "save checkpoint as best-by-FID" tracking (the
-        # outputs/checkpoints/best.pt that dvc.yaml's evaluate stage
-        # depends on) is intentionally NOT implemented yet — it needs a
-        # real FID number to compare against, which only exists once
-        # Phase 4's fid.py is built. Re-introduce a best_fid tracking
-        # variable here when wiring that in, rather than carrying a
-        # dead placeholder in the meantime (flake8 correctly flagged the
-        # earlier unused `best_fid = float("inf")` line as dead code).
+
         grad_norm_history: list = []
         confirmed_pushed_checkpoints: set = set()
 
@@ -465,74 +448,37 @@ def train(cfg: DictConfig) -> None:
         checkpoint_every = cfg.experiment.training.checkpoint_every_n_steps
 
         # ── Best-checkpoint tracking ─────────────────────────────────────────
-        # WHY ema_loss, NOT raw loss: ema_loss is the smoothed training signal
-        # (exponential moving average of per-step loss values). Raw loss is
-        # noisy — a single easy/hard batch can look like the best or worst
-        # step even if nothing meaningful changed. ema_loss gives a stable
-        # trend that actually reflects whether the model improved over the
-        # last N steps, making it a much more reliable "best model so far"
-        # criterion than a lucky raw-loss reading.
+        # WHY ema_loss, NOT raw loss: ema_loss is the smoothed training signal.
+        # Raw loss is noisy — a single easy/hard batch can look like the best
+        # or worst step even if nothing meaningful changed. ema_loss gives a
+        # stable trend that actually reflects model improvement, making it a
+        # far more reliable "best model so far" criterion than a lucky raw
+        # loss reading.
         best_ema_loss: float = float("inf")
         best_ckpt_path = checkpoint_dir / "best.pt"
-        consecutive_bad_steps: int = 0
 
         # WHY WE LOAD best_ema_loss FROM best.pt ON STARTUP: without this,
         # every resume starts the explosion guard blind (best_ema_loss=inf
         # means is_exploded can never trigger) until a fresh epoch
-        # completes — leaving the first ~390 steps after a resume
-        # unprotected, which is exactly the window where the second
-        # collapse occurred. Loading the persisted value means protection
-        # is active from step 1 of a resumed run.
+        # completes. Loading the persisted value means protection is
+        # active from step 1 of a resumed run.
+        #
+        # WHY map_location="cpu" HERE, UNLIKE THE RESUME LOAD ABOVE: we
+        # only need one scalar (best_ema_loss) out of this checkpoint.
+        # Loading with map_location=device pulls the full model state
+        # dict + optimizer state + EMA state (~880MB) onto the GPU for
+        # no reason, on top of whatever's already loaded for resume —
+        # this exact redundant load caused a real CUDA OOM in an earlier
+        # run. Loading to CPU and deleting immediately after reading the
+        # one field we need keeps this a near-zero GPU memory cost.
         if best_ckpt_path.exists():
-            _best_ckpt = torch.load(best_ckpt_path, map_location=device)
+            _best_ckpt = torch.load(best_ckpt_path, map_location="cpu")
             best_ema_loss = _best_ckpt.get("best_ema_loss", float("inf"))
+            del _best_ckpt
             print(f"[train] loaded best_ema_loss={best_ema_loss:.4f} from {best_ckpt_path}")
 
-        # ── Early stopping ───────────────────────────────────────────────────
-        early_stop_patience = cfg.experiment.training.get("early_stop_patience", 0)
-        # 0 means disabled — no early stopping by default. Set a positive
-        # integer in config (e.g. early_stop_patience: 20) to stop after
-        # that many epochs with no improvement in ema_loss.
-        epochs_without_improvement: int = 0
-
-        # ── Cosine LR schedule ───────────────────────────────────────────────
-        # WHY COSINE, NOT CONSTANT: a flat LR works but cosine decay gives
-        # the optimizer a long warm plateau followed by a gentle cooldown in
-        # the final epochs, which consistently improves final loss by 5-10%
-        # in diffusion model training without any additional hyperparameters
-        # to tune. T_max = total training steps (not epochs) so the decay
-        # is smooth across the full run regardless of steps_per_epoch.
-        use_lr_schedule = cfg.experiment.training.get("cosine_lr_schedule", False)
-        scheduler = None  # set after steps_per_epoch is known
-
         ema_loss_value: Optional[float] = None
-
         steps_per_epoch = len(train_loader)
-
-        if use_lr_schedule:
-            remaining_epochs = num_epochs - start_epoch
-            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=remaining_epochs * steps_per_epoch,
-                eta_min=cfg.experiment.training.lr * 0.1,
-                # WHY 10% of base LR as minimum: decaying all the way to 0
-                # can destabilise the final epochs when the model is close
-                # to convergence — 10% keeps updates meaningful without the
-                # large steps that caused instability earlier in training.
-            )
-            # If resuming mid-run, fast-forward the scheduler state to match
-            # where we actually are in the cosine curve. Without this, a
-            # resumed run would restart the cosine decay from its peak rather
-            # than continuing the curve the original run was following.
-            warmup_steps = (start_epoch - 0) * steps_per_epoch
-            if warmup_steps > 0:
-                for _ in range(warmup_steps):
-                    scheduler.step()
-            print(
-                f"[train] cosine LR schedule: {cfg.experiment.training.lr:.2e} → "
-                f"{cfg.experiment.training.lr * 0.1:.2e} over "
-                f"{remaining_epochs} epochs"
-            )
 
         print(f"[train] starting training: {num_epochs} epochs, {steps_per_epoch} steps/epoch")
 
@@ -540,16 +486,11 @@ def train(cfg: DictConfig) -> None:
             # NOTE: resume granularity is per-EPOCH, not per-batch. If a
             # session ends mid-epoch, the checkpoint stores the epoch
             # index but not which batch within it we'd reached. On
-            # resume, we restart that epoch from its first batch. This
-            # means a resumed run sees a partially-repeated epoch's worth
-            # of data — an honest, acceptable compromise (not a silent
-            # bug) given that: (1) optimizer and EMA state correctly
-            # carry over, so this isn't a cold-restart, (2) augmentation
-            # re-randomizes every time, so it's not pixel-identical
-            # repeated data, and (3) one repeated epoch out of 200 is
-            # negligible. True per-batch resume would require checkpointing
-            # the DataLoader's internal iteration state, which adds
-            # significant complexity for a marginal benefit at our scale.
+            # resume, we restart that epoch from its first batch — an
+            # honest, acceptable compromise (optimizer/EMA state still
+            # carries over correctly, augmentation re-randomizes the
+            # repeated data, and one repeated epoch out of 200 is
+            # negligible).
             epoch_start_time = time.time()
 
             for batch_idx, (images, labels) in enumerate(train_loader):
@@ -578,14 +519,24 @@ def train(cfg: DictConfig) -> None:
                     # around this one mathematical statement.
 
                 # ── Loss explosion guard (NaN/Inf AND finite-but-exploded) ──
-                # WHY BOTH CASES MATTER: the first collapse (step ~23,923)
-                # was a NaN — caught by torch.isfinite(). The second collapse
-                # (step ~12,700, this run) was loss flatlining at ~1.0, which
-                # IS finite — MSE(0, unit-variance noise) ≈ 1.0, the exact
-                # signature of the model collapsing to predicting all zeros.
-                # torch.isfinite() alone does not catch this, so we ALSO
-                # check loss against a multiple of best_ema_loss once we
-                # have a real baseline to compare against.
+                # WHY BOTH CASES MATTER: a NaN loss is caught by
+                # torch.isfinite(). A model collapsing to predicting all
+                # zeros produces a FINITE loss around 1.0 (MSE of zero vs
+                # unit-variance noise ≈ 1.0) that torch.isfinite() alone
+                # does not catch — we also check loss against a multiple
+                # of best_ema_loss once we have a real baseline.
+                #
+                # WHY WE ONLY SKIP THE STEP, NOT AUTO-RECOVER: an earlier
+                # version restored from best.pt and halved the LR after
+                # 30 consecutive bad steps. That machinery introduced its
+                # own bug (a CUDA OOM) and added a lot of complexity for
+                # a failure mode we have not yet confirmed actually needs
+                # automatic intervention rather than a human noticing the
+                # warning and restarting from best.pt manually. Skipping
+                # individual bad steps is cheap and safe; if sustained
+                # collapse turns out to be a real recurring problem with
+                # THIS simpler setup, that is worth solving deliberately
+                # rather than carrying speculative rescue code now.
                 loss_value_this_step = loss.item()
                 is_finite = torch.isfinite(loss)
                 is_exploded = (
@@ -596,51 +547,14 @@ def train(cfg: DictConfig) -> None:
                 )
 
                 if not is_finite or is_exploded:
-                    consecutive_bad_steps += 1
                     print(
                         f"[WARNING] step {global_step}: loss={loss_value_this_step:.4f} "
                         f"is {'non-finite' if not is_finite else 'exploded (>5x best_ema_loss)'} "
-                        f"— skipping backward/step ({consecutive_bad_steps} consecutive)."
+                        f"— skipping backward/step."
                     )
                     optimizer.zero_grad(set_to_none=True)
-
-                    # ── Auto-recovery: sustained collapse → roll back ────────
-                    # WHY THIS EXISTS: a single bad batch recovers fine by
-                    # just skipping it (above). But the actual failure mode
-                    # we've hit twice now is the model PERMANENTLY collapsing
-                    # — every subsequent step is also bad, forever, because
-                    # the weights themselves are now garbage. Skipping
-                    # individual steps in that case just burns GPU-hours
-                    # doing nothing for the rest of the run (exactly what
-                    # happened for 140 dead epochs the first time). If we
-                    # see enough CONSECUTIVE bad steps to rule out "one bad
-                    # batch," the weights are unrecoverable — restore the
-                    # last known-good state from best.pt and halve the LR
-                    # so the optimizer is less likely to walk off the cliff
-                    # the same way twice.
-                    if consecutive_bad_steps >= 30 and best_ckpt_path.exists():
-                        print(
-                            f"[train] {consecutive_bad_steps} consecutive bad steps — "
-                            f"model has likely collapsed permanently. Restoring "
-                            f"from {best_ckpt_path} and halving LR."
-                        )
-                        recovery_ckpt = torch.load(best_ckpt_path, map_location=device)
-                        model.load_state_dict(recovery_ckpt["model_state_dict"])
-                        optimizer.load_state_dict(recovery_ckpt["optimizer_state_dict"])
-                        ema.load_state_dict(recovery_ckpt["ema_state_dict"])
-                        for group in optimizer.param_groups:
-                            group["lr"] *= 0.5
-                        print(
-                            f"[train] recovered from epoch {recovery_ckpt['epoch']} "
-                            f"(ema_loss={recovery_ckpt.get('best_ema_loss', 'n/a')}). "
-                            f"New LR: {optimizer.param_groups[0]['lr']:.2e}"
-                        )
-                        consecutive_bad_steps = 0
-
                     global_step += 1
                     continue
-
-                consecutive_bad_steps = 0
 
                 # ── Backward pass ────────────────────────────────────────────
                 scaler.scale(loss).backward()
@@ -657,10 +571,6 @@ def train(cfg: DictConfig) -> None:
 
                 scaler.step(optimizer)
                 scaler.update()
-
-                # ── LR scheduler step ────────────────────────────────────────
-                if scheduler is not None:
-                    scheduler.step()
 
                 # ── EMA update (Phase 1's EMA class, warmup-aware) ──────────
                 ema.update(model, global_step)
@@ -738,11 +648,9 @@ def train(cfg: DictConfig) -> None:
                     # Adam stores momentum AND variance per parameter +
                     # EMA shadow 0.22GB). Without bounding local disk
                     # usage, checkpoints accumulate uncapped — this
-                    # caused a REAL crash during this project's first
-                    # full baseline run on Kaggle (disk exhausted after
-                    # ~5 accumulated checkpoints, 14 epochs into an
-                    # 18-hour run). We only ever delete a checkpoint
-                    # that's in confirmed_pushed_checkpoints.
+                    # caused a real disk-exhaustion crash earlier in this
+                    # project. We only ever delete a checkpoint that's in
+                    # confirmed_pushed_checkpoints.
                     cleanup_old_checkpoints(
                         checkpoint_dir,
                         keep_last_n=3,
@@ -764,13 +672,12 @@ def train(cfg: DictConfig) -> None:
             # ── Best checkpoint ──────────────────────────────────────────────
             # Save best.pt whenever ema_loss improves. This runs EVERY epoch
             # so we always have the best weights seen so far, regardless of
-            # what happens later in training (NaN collapse, quota error, etc.)
-            # Only save if ema_loss is a valid finite number — a NaN ema_loss
-            # must never overwrite a previously good best.pt.
+            # what happens later in training. Only save if ema_loss is a
+            # valid finite number — a NaN ema_loss must never overwrite a
+            # previously good best.pt.
             if ema_loss_value is not None and math.isfinite(ema_loss_value):
                 if ema_loss_value < best_ema_loss:
                     best_ema_loss = ema_loss_value
-                    epochs_without_improvement = 0
                     torch.save(
                         {
                             "model_state_dict": model.state_dict(),
@@ -797,17 +704,6 @@ def train(cfg: DictConfig) -> None:
                             "best_epoch": float(epoch),
                         },
                     )
-                else:
-                    epochs_without_improvement += 1
-
-            # ── Early stopping ───────────────────────────────────────────────
-            if early_stop_patience > 0 and epochs_without_improvement >= early_stop_patience:
-                print(
-                    f"[train] early stopping: no improvement in ema_loss for "
-                    f"{epochs_without_improvement} epochs (patience={early_stop_patience}). "
-                    f"Best was {best_ema_loss:.4f} at epoch {epoch - epochs_without_improvement}."
-                )
-                break
 
         print(f"[train] training complete. Total steps: {global_step}")
         if best_ckpt_path.exists():

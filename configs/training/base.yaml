@@ -39,14 +39,6 @@ mixed_precision: false
 # a tighter leash on how large any single update can be.
 grad_clip_norm: 0.5
 
-# Cosine LR decay — decays LR from `lr` down to lr*0.1 over the full run.
-# Set to false to keep a flat learning rate (original behaviour).
-cosine_lr_schedule: true
-
-# Early stopping — stop if ema_loss doesn't improve for this many epochs.
-# 0 = disabled (always run all num_epochs).
-early_stop_patience: 0
-
 # Checkpointing
 checkpoint_every_n_steps: 1000
 keep_last_n_checkpoints: 3
