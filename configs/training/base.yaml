@@ -24,6 +24,13 @@ lr: 1e-4
 batch_size: 64
 num_epochs: 200
 
+# Linear LR warmup over the first N steps, then flat at `lr` — the
+# standard fix used by every reference DDPM training script (HuggingFace
+# diffusers, lucidrains) for early-training instability. 500 steps is the
+# commonly used default; at batch_size=64 that's roughly 1.3 epochs of
+# CIFAR-10 ramping up before the optimizer is trusted with the full LR.
+lr_warmup_steps: 500
+
 optimizer: adamw
 weight_decay: 0.0
 adam_beta1: 0.9
@@ -40,13 +47,11 @@ ema_decay: 0.9999
 # fp32 training is ~20% slower on T4 but eliminates the overflow risk entirely.
 mixed_precision: false
 
-# Gradient clipping — caps grad_norm to prevent the instability spikes
-# that Phase 2 Step 2's detect_instability() function watches for.
-# WHY TIGHTENED FROM 1.0: grad_norm reached 26.96 before the first collapse —
-# clipping to 1.0 wasn't aggressive enough to prevent the underlying step
-# from still being destabilising. 0.5 trades a little convergence speed for
-# a tighter leash on how large any single update can be.
-grad_clip_norm: 0.5
+# Gradient clipping — the standard value used by every reference DDPM
+# training script. Combined with LR warmup (above), this is the proven
+# combination for training stability rather than a value we keep retuning
+# after each crash.
+grad_clip_norm: 1.0
 
 # Checkpointing
 checkpoint_every_n_steps: 1000
