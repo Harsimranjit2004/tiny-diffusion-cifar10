@@ -11,8 +11,17 @@
 # the optimizer taking steps too large for this model/batch size combo.
 # Halving LR trades a small amount of convergence speed for meaningfully
 # more headroom before hitting the same instability a third time.
+# WHY LOWERED FROM 128: disabling AMP (mixed_precision: false, below) means
+# forward/backward activations are stored in fp32 instead of fp16, roughly
+# doubling per-step memory. The fp16 validation run already reserved ~9.5GB
+# on the T4's 16GB at batch_size=128 — fp32 at the same batch size hit a
+# real CUDA OOM during the very first forward pass after resuming. Halving
+# batch_size brings activation memory back into a safe range while staying
+# in fp32 (no reintroduction of the AMP overflow risk that caused the
+# original two collapses). Optimizer/EMA state size is unaffected by batch
+# size, so this only trades off step-to-step gradient noise, not stability.
 lr: 1e-4
-batch_size: 128
+batch_size: 64
 num_epochs: 200
 
 optimizer: adamw
